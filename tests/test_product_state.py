@@ -1,0 +1,929 @@
+"""Durable projects, durable runs, and one authoritative object for each.
+
+The product failure these guard against is not a crash. It is a scientist
+starting a fifteen-minute AI investigation, opening another page, and finding
+that the work is gone — or worse, that two pages disagree about whether it is
+still running. So:
+
+* a project is a file on the server, created once and surviving a refresh, a
+  restart and a redeploy;
+* a run is a background job on the server, which the browser observes and does
+  not own; closing the browser, switching project or losing the stream changes
+  what is visible and nothing about what is executing;
+* there is exactly one run object, and every view renders it, so Discovery and
+  Runs cannot disagree.
+
+Nothing here calls a model or contacts Omnigent: the real-AI path is exercised
+through its own seams.
+"""
+import json
+import shutil
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+from biosense import contracts as K
+from biosense import workspace as WS
+from biosense.production import activity as ACT
+from biosense.production import authz as AZ
+from biosense.production import budget as BU
+from biosense.production import project_builder as PB
+from biosense.production import run_store as RS
+from biosense.production import runtime as RT
+
+OBJECTIVE = 'Increase viable macrophage production while maintaining identity and viability.'
+
+
+class ProjectCreationTests(unittest.TestCase):
+    """A project is a durable scientific workspace, not a page's state."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.who = WS.WorkspaceIdentity(f'owner{id(self)}@lab.example', authenticated=True,
+                                        server='https://id.example')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_few_fields_make_a_real_validated_project(self):
+        doc = PB.quick_build(project_id='human_macrophage_opt',
+                             name='Human Macrophage Optimization', species='Human',
+                             starting_cell='iPSC', target_cell='Macrophage',
+                             process_context='iPSC to macrophage',
+                             goal='Improve viable macrophage output')
+        K.require_valid('project_profile', doc)
+        self.assertEqual('Human', doc['biological_system']['species'])
+        self.assertEqual('Macrophage', doc['biological_system']['target_cell'])
+        self.assertIn('Improve viable macrophage output', doc['description'])
+        self.assertTrue(doc['stages'])
+        self.assertTrue(doc['parameters'])
+
+    def test_it_invents_no_biology_and_says_so(self):
+        """The shared vessel can be defaulted because it means the same thing in
+        every project. Biology cannot: no simulator, no modelled parameter, no
+        cell-type-specific knob appears because nobody asked for one."""
+        doc = PB.quick_build(project_id='some_process', name='Some Process')
+        self.assertIsNone(doc['simulator']['model_id'])
+        self.assertEqual('none', doc['simulator']['status'])
+        from biosense import projects as PJ
+        project = PJ.Project(doc)
+        self.assertEqual([], sorted(project.modelled_ids()))
+        self.assertTrue(any('lightweight project form' in l for l in doc['limitations']))
+
+    def test_a_created_project_outlives_the_process_that_created_it(self):
+        import os
+        os.environ['BIOSENSE_PRIVATE_DATA'] = str(self.tmp)
+        try:
+            doc = PB.quick_build(project_id='durable_one', name='Durable One',
+                                 species='Human', target_cell='Neutrophil')
+            PB.save(self.who, doc)
+            # Nothing is cached: a second reader, as a restarted process would be,
+            # finds it on disk.
+            again = PB.load_for(self.who, 'durable_one')
+            self.assertEqual('Durable One', again.name)
+            self.assertIn('durable_one',
+                          [p.project_id for p in PB.workspace_projects(self.who)])
+        finally:
+            os.environ.pop('BIOSENSE_PRIVATE_DATA', None)
+
+    def test_a_project_belongs_to_one_account(self):
+        import os
+        os.environ['BIOSENSE_PRIVATE_DATA'] = str(self.tmp)
+        try:
+            other = WS.WorkspaceIdentity('other@lab.example', authenticated=True,
+                                         server='https://id.example')
+            PB.save(self.who, PB.quick_build(project_id='mine_only', name='Mine Only'))
+            self.assertEqual([], [p.project_id for p in PB.workspace_projects(other)])
+            with self.assertRaises(K.ContractError):
+                PB.load_for(other, 'mine_only')
+        finally:
+            os.environ.pop('BIOSENSE_PRIVATE_DATA', None)
+
+
+class ActivityTests(unittest.TestCase):
+    """What the live viewer is told, derived from typed events alone."""
+
+    def events(self):
+        return [
+            {'seq': 0, 'at': 10, 'kind': 'accepted', 'stage': 'understanding_objective',
+             'simple': 'Your question reached the discovery agents.'},
+            {'seq': 1, 'at': 20, 'kind': 'tool', 'tool': 'sys_session_send',
+             'technical': 'literature-it1: find claims on G-CSF and neutrophil maturation'},
+            {'seq': 2, 'at': 90, 'kind': 'tool_result', 'tool': 'sys_session_send',
+             'technical': 'literature returned 7 claims'},
+            {'seq': 3, 'at': 95, 'kind': 'tool', 'tool': 'sys_session_send',
+             'technical': 'bioinformatics-it1: evaluate GSE155719'},
+            {'seq': 4, 'at': 150, 'kind': 'tool_result', 'tool': 'bash',
+             'technical': 'analysis refused: metadata join unsupported for this dataset'},
+            {'seq': 5, 'at': 200, 'kind': 'tool', 'tool': 'bash',
+             'technical': 'wrote quantified_hypothesis.json'},
+        ]
+
+    def test_an_agent_is_running_because_a_dispatch_was_seen(self):
+        a = ACT.Activity.from_events(self.events(), started_at=0)
+        by = {r['agent']: r for r in a.snapshot(now=210)['agents']}
+        self.assertEqual('running', by['bioinformatics']['status'])
+        self.assertEqual('queued', by['biosimulator']['status'])
+        self.assertIn('G-CSF', by['literature']['task'])
+
+    def test_the_dispatch_being_accepted_is_not_the_agent_finishing(self):
+        """The orchestrator is asynchronous: the send tool returns at once, and the
+        specialist starts then. Calling it finished there showed every agent
+        "done" seconds after it was asked."""
+        a = ACT.Activity.from_events(self.events(), started_at=0)
+        by = {r['agent']: r for r in a.snapshot(now=210)['agents']}
+        self.assertEqual('running', by['literature']['status'])
+
+    def test_a_child_session_says_when_its_specialist_finished(self):
+        rows = self.events() + [
+            {'seq': 6, 'at': 230, 'kind': 'subagent', 'agent': 'literature',
+             'child_session_id': 'conv_lit', 'state': 'finished',
+             'simple': 'Literature agent finished its task.'},
+            {'seq': 7, 'at': 240, 'kind': 'subagent', 'agent': 'bioinformatics',
+             'child_session_id': 'conv_bio', 'state': 'failed'},
+        ]
+        a = ACT.Activity.from_events(rows, started_at=0)
+        by = {r['agent']: r for r in a.snapshot(now=250)['agents']}
+        self.assertEqual('complete', by['literature']['status'])
+        self.assertEqual('conv_lit', by['literature']['child_session_id'])
+        self.assertEqual('failed', by['bioinformatics']['status'])
+        self.assertNotIn('Literature', a.snapshot(now=250)['active_agents'])
+
+    def test_a_specialists_own_events_do_not_keep_the_orchestrator_busy(self):
+        a = ACT.Activity(started_at=0)
+        a.observe({'at': 5, 'kind': 'subagent', 'agent': 'analysis', 'state': 'started',
+                   'child_session_id': 'conv_an', 'task': 'analysis-it1'})
+        a.observe({'at': 9, 'kind': 'tool', 'tool': 'bash', 'agent': 'analysis',
+                   'technical': 'bioinformatics.cli execute plan.json'})
+        by = {r['agent']: r for r in a.snapshot(now=10)['agents']}
+        self.assertEqual('running', by['analysis']['status'])
+        self.assertEqual(9, by['analysis']['last_activity_at'])
+        self.assertEqual('queued', by['orchestrator']['status'])
+
+    def test_prose_about_an_agent_does_not_start_one(self):
+        """A bash line containing the word "analysis" is prose. Showing work that
+        is not happening is the failure this rule exists to prevent."""
+        a = ACT.Activity.from_events(self.events(), started_at=0)
+        by = {r['agent']: r for r in a.snapshot()['agents']}
+        self.assertEqual('queued', by['analysis']['status'])
+
+    def test_a_refusal_is_kept_where_a_scientist_can_see_it(self):
+        a = ACT.Activity.from_events(self.events(), started_at=0)
+        snap = a.snapshot()
+        self.assertTrue(snap['limitations'])
+        self.assertIn('metadata join', snap['limitations'][0]['text'])
+        self.assertIn('limitation', [t['kind'] for t in snap['timeline']])
+
+    def test_an_artifact_is_a_file_that_exists_not_a_filename_in_a_tool_call(self):
+        """The brief ASKS for `analysis_plan.json` by name, so matching filenames
+        in tool text reported artifacts a run had never produced — the page
+        showed two files written by a run that wrote none."""
+        a = ACT.Activity.from_events(self.events(), started_at=0)
+        self.assertEqual([], a.snapshot()['artifacts'])
+        a.observe_files(['quantified_hypothesis.json', 'discovery_request.json',
+                         'brief.md'], at=210)
+        names = [x['name'] for x in a.snapshot()['artifacts']]
+        self.assertEqual(['quantified_hypothesis.json'], names,
+                         'the files BioSense writes itself are not agent output')
+        a.observe_files(['quantified_hypothesis.json'], at=240)
+        self.assertEqual(1, len(a.snapshot()['artifacts']), 'a file is announced once')
+
+    def test_a_tool_listing_that_describes_refusals_is_not_a_limitation(self):
+        """The tool registry says what it refuses ("Raw counts are refused"); every
+        listing of it was shown as a limitation card, twice, as raw JSON."""
+        listing = json.dumps({'stdout': json.dumps({'tools': [
+            {'name': 'expression.de', 'notes': 'Raw counts are refused.'}]}),
+            'stderr': '', 'exit_code': 0})
+        self.assertIsNone(ACT.refusal_in(listing))
+        self.assertIsNone(ACT.refusal_in('{"tools": [{"notes": "Raw counts are refus'))
+        a = ACT.Activity(started_at=0)
+        a.observe({'at': 1, 'kind': 'tool_result', 'tool': 'bash', 'technical': listing})
+        self.assertEqual([], a.snapshot()['limitations'])
+
+    def test_an_explicit_refusal_or_a_failed_command_is_a_limitation(self):
+        refused = json.dumps({'stdout': json.dumps(
+            {'refused': True, 'reason': 'metadata cannot be joined'}), 'stderr': '',
+            'exit_code': 1})
+        self.assertEqual('metadata cannot be joined', ACT.refusal_in(refused))
+        crashed = json.dumps({'stdout': '', 'stderr': 'ContractError: no plan',
+                              'exit_code': 1})
+        self.assertIn('no plan', ACT.refusal_in(crashed))
+        not_found = json.dumps({'stdout': '{"found": false}', 'stderr': '', 'exit_code': 2})
+        self.assertIsNone(ACT.refusal_in(not_found), 'an unannotated gene is an answer')
+        a = ACT.Activity(started_at=0)
+        for at in (1, 2):
+            a.observe({'at': at, 'kind': 'tool_result', 'tool': 'bash', 'technical': refused})
+        self.assertEqual(1, len(a.snapshot()['limitations']), 'the same refusal is one card')
+
+    def test_an_agent_s_own_slip_is_a_note_not_a_limitation(self):
+        """Two cards a live run showed: a shell outside the workspace, and the
+        agent's own inline script failing. Neither is about the data."""
+        wrong_dir = json.dumps({'stdout': '', 'exit_code': 127,
+                                'stderr': '/usr/bin/bash: line 1: .venv/bin/python: '
+                                          'No such file or directory'})
+        scratch = json.dumps({'stdout': '', 'exit_code': 1, 'stderr':
+                              'Traceback (most recent call last):\n  File "<string>", line 7, '
+                              "in <module>\nAttributeError: 'str' object has no attribute 'get'"})
+        tool_crash = json.dumps({'stdout': '', 'exit_code': 1, 'stderr':
+                                 'Traceback (most recent call last):\n  File "<string>", line 1, '
+                                 'in <module>\n  File "/app/biosense/data/registry.py", line 9\n'
+                                 'ValueError: bad manifest'})
+        a = ACT.Activity(started_at=0)
+        for at, t in enumerate((wrong_dir, scratch, tool_crash), 1):
+            a.observe({'at': at, 'kind': 'tool_result', 'tool': 'bash', 'technical': t})
+        snap = a.snapshot()
+        self.assertEqual(1, len(snap['limitations']), 'a BioSense tool failing still counts')
+        self.assertIn('bad manifest', snap['limitations'][0]['text'])
+        slips = [r['text'] for r in snap['timeline'] if r['kind'] == 'agent_slip']
+        self.assertEqual(2, len(slips))
+        self.assertIn("'str' object has no attribute 'get'", slips[1])
+
+    def test_a_failed_specialist_says_why_as_a_limitation(self):
+        a = ACT.Activity(started_at=0)
+        a.observe({'at': 5, 'kind': 'subagent', 'agent': 'literature', 'state': 'failed',
+                   'child_session_id': 'conv_lit',
+                   'technical': 'child session conv_lit (literature:literature-it1-retry) '
+                                'failed: Europe PMC could not be reached'})
+        texts = [r['text'] for r in a.snapshot()['limitations']]
+        self.assertEqual(['Literature agent failed: Europe PMC could not be reached'], texts)
+
+    def test_last_activity_is_what_says_a_quiet_run_is_alive(self):
+        a = ACT.Activity.from_events(self.events(), started_at=0)
+        self.assertEqual(200, a.snapshot(now=200)['last_activity_at'])
+        self.assertEqual(45.0, a.snapshot(now=245)['idle_s'])
+
+    def test_reasoning_moves_the_clock_and_is_never_shown(self):
+        a = ACT.Activity(started_at=0)
+        a.observe({'kind': 'reasoning', 'at': 5, 'technical': 'the model thinking out loud'})
+        snap = a.snapshot(now=5)
+        self.assertEqual(5, snap['last_activity_at'])
+        self.assertEqual([], snap['timeline'])
+
+    def test_the_whole_picture_rebuilds_from_the_journal(self):
+        """A restarted process must show what a live one shows, or a reader
+        concludes a working run is dead."""
+        live = ACT.Activity(started_at=0)
+        for e in self.events():
+            live.observe(e)
+        rebuilt = ACT.Activity.from_events(self.events(), started_at=0)
+        self.assertEqual(live.snapshot(now=300)['agents'], rebuilt.snapshot(now=300)['agents'])
+        self.assertEqual(live.snapshot(now=300)['limitations'],
+                         rebuilt.snapshot(now=300)['limitations'])
+
+    def test_progress_is_counted_and_never_computed_as_a_fraction(self):
+        """The activity bar is indeterminate on purpose: the work left is not
+        proportional to the stages left — a run can spend eleven minutes inside
+        one analysis — so a bar implying otherwise lies once a second."""
+        from biosense.production import stages as ST
+        counts = ST.stage_counts({'understanding_objective'})
+        self.assertEqual({'done', 'total', 'current'}, set(counts))
+        self.assertIsInstance(counts['done'], int)
+        snap = ACT.Activity.from_events(self.events(), started_at=0).snapshot()
+        for key in snap:
+            self.assertNotIn('percent', key)
+            self.assertNotIn('fraction', key)
+        css = (K.ROOT / 'webapp' / 'brand.css').read_text()
+        bar = css[css.index('.rv-bar{'):css.index('.rv-stats')]
+        self.assertIn('animation', bar, 'the bar must be indeterminate')
+        self.assertNotIn('width:var(', bar, 'nothing may drive the bar from data')
+
+
+class EmptyRunDiagnosisTests(unittest.TestCase):
+    """A real run that produced nothing says what happened.
+
+    The page used to show "No hypothesis was formed by this run", which reads as
+    a scientific conclusion when it is almost always a mechanical one: the
+    orchestrator ended without asking a specialist, or the specialists wrote
+    nothing BioSense could read.
+    """
+
+    def _activity(self, *events):
+        a = ACT.Activity(started_at=0)
+        for e in events:
+            a.observe(e)
+        return a
+
+    def test_an_orchestrator_that_asked_nobody_is_named_as_such(self):
+        a = self._activity(
+            {'kind': 'accepted', 'at': 1, 'simple': 'Your question reached the agents.'},
+            {'kind': 'tool', 'tool': 'sys_os_shell', 'at': 4, 'technical': 'ls'},
+            {'kind': 'waiting', 'at': 9, 'omnigent_type': 'turn.completed', 'simple': 'turn 1'})
+        d = a.diagnose(artifacts_ingested=1, hypotheses=0)
+        self.assertIn('without asking any specialist', d['headline'])
+        self.assertEqual([], d['agents_dispatched'])
+        self.assertEqual(1, d['turns'])
+        self.assertTrue(d['next_steps'])
+
+    def test_what_the_orchestrator_last_said_is_shown_with_the_diagnosis(self):
+        """Usually a question for a person nobody is there to answer. Without
+        it, "asked nobody" is a fact with no explanation."""
+        a = self._activity(
+            {'kind': 'reasoning', 'at': 2, 'technical': 'private thinking'},
+            {'kind': 'message', 'role': 'assistant', 'at': 8,
+             'technical': 'Before I start: which QC profile and target day?'})
+        d = a.diagnose(artifacts_ingested=1, hypotheses=0)
+        self.assertIn('QC profile', d['orchestrator_said'])
+        self.assertIn('waiting for a person', d['why'])
+        self.assertNotIn('private thinking', json.dumps(a.snapshot()))
+        # A specialist's message is the specialist's, not the orchestrator's.
+        a.observe({'kind': 'message', 'role': 'assistant', 'agent': 'literature', 'at': 9,
+                   'technical': 'a specialist talking'})
+        self.assertIn('QC profile', a.last_said)
+
+    def test_specialists_that_wrote_nothing_are_named_too(self):
+        a = self._activity(
+            {'kind': 'tool', 'tool': 'sys_session_send', 'at': 5,
+             'technical': 'literature-it1: find claims'},
+            {'kind': 'tool_result', 'tool': 'sys_session_send', 'at': 60,
+             'technical': 'literature answered'})
+        d = a.diagnose(artifacts_ingested=1, hypotheses=0)
+        self.assertIn('Literature', d['headline'])
+        self.assertIn('no artifact was written', d['headline'])
+
+    def test_a_run_that_produced_a_hypothesis_is_not_diagnosed_at_all(self):
+        a = self._activity({'kind': 'accepted', 'at': 1, 'simple': 'x'})
+        self.assertIsNone(a.diagnose(artifacts_ingested=4, hypotheses=1))
+        self.assertIsNone(a.diagnose(artifacts_ingested=1, hypotheses=0, is_real=False))
+
+
+class CanonicalDirectoryTests(unittest.TestCase):
+    """One directory per run, named the way the runner will resolve it."""
+
+    def test_agents_are_given_the_run_directory_relative_to_their_workspace(self):
+        """It used to be a bare directory name, so the agents wrote under the
+        workspace root while BioSense read under the runs directory, and a real
+        run left artifacts in two places with the person seeing neither."""
+        from biosense.production import discovery_runner as DR
+        cfg = RT.from_env(runs_dir=K.ROOT / 'runs',
+                          env={'BIOSENSE_RUNTIME_MODE': 'local',
+                               'BIOSENSE_OMNIGENT_WORKSPACE': str(K.ROOT)})
+        self.assertEqual('runs/ai-x', DR.run_dir_for_agents(cfg, K.ROOT / 'runs' / 'ai-x'))
+
+    def test_the_sandbox_permits_the_directory_the_agents_are_given(self):
+        """The hosted image mounts its volume at ./data, so the run directory is
+        ./data/runs. A sandbox that only allows ./runs refuses every artifact,
+        and the run finishes having written nothing — which looks exactly like a
+        model that gave up."""
+        import re as _re
+        env = {}
+        for m in _re.finditer(r'^\s*(?:ENV\s+)?([A-Z_][A-Z0-9_]*)=(\S+)',
+                              (K.ROOT / 'deploy' / 'Dockerfile.ai').read_text(), _re.M):
+            env.setdefault(m.group(1), m.group(2))
+        runs = Path(env['RUNS_DIR']).relative_to(Path(env['BIOSENSE_OMNIGENT_WORKSPACE']))
+        for config in sorted((K.ROOT / 'discovery_loop').rglob('config.yaml')):
+            text = config.read_text()
+            if 'write_paths' not in text:
+                continue
+            self.assertIn(f'./{runs}', text,
+                          f'{config.relative_to(K.ROOT)} cannot write the hosted run directory')
+
+    def test_the_brief_names_that_one_directory_everywhere(self):
+        from biosense.production import discovery as DISC
+        req = DISC.build(project_id='ipsc_macrophage', objective=OBJECTIVE,
+                         runtime_mode='local_real_ai')
+        brief = DISC.render_brief(req, loop_dir='runs/ai-20260101-abc')
+        self.assertIn('runs/ai-20260101-abc/', brief)
+        for name, _kind, _why in DISC.ARTIFACTS:
+            self.assertIn(f'runs/ai-20260101-abc/{name}', brief)
+
+
+class RunStoreTests(unittest.TestCase):
+    """The durable half of the run list."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, rid, **over):
+        state = {'run_id': rid, 'owner': 'me@lab.example', 'project_id': 'proj_a',
+                 'objective': 'x', 'status': 'done', 'started_at': 100.0,
+                 'runtime_mode': 'synthetic_demo', 'runtime_label': 'SYNTHETIC DEMO'}
+        state.update(over)
+        RS.write_state(self.tmp / f'run-{rid}', state)
+
+    def test_runs_are_grouped_the_way_the_runs_page_shows_them(self):
+        for status, group in (('running', 'active'), ('finalizing', 'active'),
+                              ('done', 'complete'), ('stopped', 'cancelled'),
+                              ('error', 'failed'), ('interrupted', 'failed')):
+            self.assertEqual(group, RS.group_for(status), status)
+
+    def test_a_listing_is_scoped_to_its_owner_and_its_project(self):
+        self._write('a' * 16)
+        self._write('b' * 16, owner='other@lab.example')
+        self._write('c' * 16, project_id='proj_b')
+        mine = RS.listing(self.tmp, owner='me@lab.example')
+        self.assertEqual({'a' * 16, 'c' * 16}, {r['run_id'] for r in mine})
+        one = RS.listing(self.tmp, owner='me@lab.example', project_id='proj_a')
+        self.assertEqual({'a' * 16}, {r['run_id'] for r in one})
+
+    def test_a_run_nothing_is_running_is_interrupted_not_running(self):
+        self._write('d' * 16, status='running')
+        row = RS.listing(self.tmp, owner='me@lab.example')[0]
+        self.assertEqual('interrupted', row['status'])
+        self.assertEqual('failed', row['group'])
+        row = RS.listing(self.tmp, owner='me@lab.example', live_ids={'d' * 16})[0]
+        self.assertEqual('running', row['status'])
+        self.assertEqual('active', row['group'])
+
+    def test_a_finished_record_has_a_clock_that_stopped(self):
+        """Records written before `finished_at` was saved had none, and a viewer
+        counted their elapsed time up to now: a 30 s run read "24:29" later."""
+        started = time.time() - 30
+        progress = [{'stage': 'understanding_objective', 'status': 'done'},
+                    {'stage': 'identifying_uncertainty', 'status': 'skipped'}]
+        self._write('e' * 16, started_at=started, progress=progress,
+                    stage_counts={'done': 0, 'total': 10, 'current': None})
+        snap = RS.restore(self.tmp, 'e' * 16)
+        self.assertTrue(snap['finished_at'])
+        self.assertLess(snap['elapsed_s'], 60)
+        # The count agrees with the ticks beside it.
+        self.assertEqual(1, snap['stage_counts']['done'])
+        self.assertEqual(2, snap['stage_counts']['total'])
+        row = RS.listing(self.tmp, owner='me@lab.example')[0]
+        self.assertTrue(row['finished_at'])
+
+    def test_a_run_that_was_finalizing_when_the_server_went_is_interrupted(self):
+        self._write('f' * 16, status='finalizing')
+        snap = RS.restore(self.tmp, 'f' * 16)
+        self.assertEqual('interrupted', snap['status'])
+        self.assertTrue(snap['finished_at'])
+
+    def test_a_record_is_read_again_only_when_it_changed(self):
+        """Every page polls the listing every few seconds and every poll parsed
+        every state file on disk. A finished run's record never changes, so it is
+        read once; a record that changes is read again; a record that goes is gone."""
+        reads = []
+        real = RS._read_state
+        RS._read_state = lambda path: (reads.append(str(path)), real(path))[1]
+        try:
+            self._write('g' * 16, title='first')
+            self.assertEqual('first', RS.listing(self.tmp, owner='me@lab.example')[0]['title'])
+            n = len(reads)
+            RS.listing(self.tmp, owner='me@lab.example')
+            RS.listing(self.tmp, owner='me@lab.example')
+            self.assertEqual(n, len(reads), 'an unchanged record was parsed again')
+            time.sleep(0.01)
+            self._write('g' * 16, title='second')
+            self.assertEqual('second', RS.listing(self.tmp, owner='me@lab.example')[0]['title'])
+            # The "nothing is running it" rule is the caller's, not the record's,
+            # so a cached row still answers it for whoever is asking.
+            self._write('h' * 16, status='running')
+            rows = {r['run_id']: r for r in RS.listing(self.tmp, owner='me@lab.example')}
+            self.assertEqual('interrupted', rows['h' * 16]['status'])
+            rows = {r['run_id']: r for r in RS.listing(self.tmp, owner='me@lab.example',
+                                                        live_ids={'h' * 16})}
+            self.assertEqual('running', rows['h' * 16]['status'])
+            shutil.rmtree(self.tmp / f'run-{"g" * 16}')
+            self.assertEqual({'h' * 16},
+                             {r['run_id'] for r in RS.listing(self.tmp, owner='me@lab.example')})
+        finally:
+            RS._read_state = real
+
+
+class ApiTests(unittest.TestCase):
+    """The product behaviour, against a live server on a loopback port."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        from biosense.production import app as APP
+        cls.APP = APP
+        cls.tmp = Path(tempfile.mkdtemp())
+        (cls.tmp / 'runs').mkdir()
+        cls._private = os.environ.get('BIOSENSE_PRIVATE_DATA')
+        os.environ['BIOSENSE_PRIVATE_DATA'] = str(cls.tmp / 'private')
+        cfg = RT.from_env(runs_dir=cls.tmp / 'runs', env={})
+        APP.Handler.runs_dir = cls.tmp / 'runs'
+        APP.Handler.static_dir = K.ROOT / 'webapp'
+        APP.Handler.registry = APP.Registry(cls.tmp / 'runs')
+        APP.Handler.runtime_cfg = cfg
+        APP.Handler.limits = BU.Limits()
+        APP.Handler.policy = AZ.Policy()
+        APP.Handler.discovery = APP.DiscoveryRegistry(cls.tmp / 'runs', cfg)
+        APP.Handler.sessions = WS.SessionStore()
+        APP.Handler.default_identity = WS.local_identity()
+        APP.Handler._ready = {'at': 0.0, 'body': None, 'code': 503}
+        cls.srv = ThreadingHTTPServer(('127.0.0.1', 0), APP.Handler)
+        cls.srv.daemon_threads = True
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        import os
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        if cls._private is None:
+            os.environ.pop('BIOSENSE_PRIVATE_DATA', None)
+        else:
+            os.environ['BIOSENSE_PRIVATE_DATA'] = cls._private
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _req(self, method, path, body=None):
+        r = urllib.request.Request(
+            f'http://127.0.0.1:{self.port}{path}', method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(r, timeout=120) as resp:
+                return resp.status, json.loads(resp.read() or b'{}')
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b'{}')
+
+    def _ended_real_run(self, rid, status='done'):
+        from biosense.production import discovery as DISC
+        d = self.tmp / 'runs' / f'ai-20260101-{rid[:6]}'
+        d.mkdir()
+        req = DISC.build(project_id='ipsc_macrophage', runtime_mode='local_real_ai',
+                         objective='increase viable macrophage yield from iPSC')
+        (d / 'discovery_request.json').write_text(json.dumps(req))
+        (d / 'round_plan.json').write_text(json.dumps({
+            'kind': 'round_plan', 'round': 1, 'commitment_sha256': 'c' * 64, 'replicates': 2,
+            'arms': [{'arm_id': 'A0', 'control': True, 'setpoints': {}},
+                     {'arm_id': 'A1', 'control': False, 'setpoints': {'mcsf_ng_ml': 50}}],
+            'readouts': [{'name': 'CD14+', 'unit': '%', 'when': 'harvest'}],
+            'decision_rules': []}))
+        RS.write_state(d, {'run_id': rid, 'status': status, 'is_real': True,
+                           'runtime_mode': 'local_real_ai', 'owner': None,
+                           'project_id': 'ipsc_macrophage', 'objective': req['objective'],
+                           'run_dir': d.name, 'started_at': time.time() - 60,
+                           'finished_at': time.time()})
+        return d
+
+    def _raw(self, path, **headers):
+        """Status, headers and body of a GET, with a 304 as an answer rather than an error."""
+        r = urllib.request.Request(f'http://127.0.0.1:{self.port}{path}', headers=headers)
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read()
+
+    def test_the_interface_is_validated_not_redownloaded_and_sent_compressed(self):
+        """Static files went out with `no-store`, so every page view fetched the
+        whole interface again, uncompressed. Now the browser keeps its copy and
+        asks whether it changed; a client that accepts gzip gets text and JSON
+        compressed; an image is left as it is."""
+        import gzip
+        code, h, body = self._raw('/discovery.js')
+        self.assertEqual(200, code)
+        self.assertEqual('no-cache', h['Cache-Control'])
+        self.assertTrue(h.get('ETag'))
+        self.assertNotIn('Content-Encoding', h)
+        self.assertTrue(body.startswith(b"'use strict'") or b'function' in body[:2000])
+        code, h2, body2 = self._raw('/discovery.js', **{'If-None-Match': h['ETag']})
+        self.assertEqual(304, code)
+        self.assertEqual(b'', body2)
+        self.assertEqual(h['ETag'], h2['ETag'])
+        code, h3, body3 = self._raw('/discovery.js', **{'Accept-Encoding': 'gzip'})
+        self.assertEqual(200, code)
+        self.assertEqual('gzip', h3['Content-Encoding'])
+        self.assertEqual('Accept-Encoding', h3['Vary'])
+        self.assertLess(len(body3), len(body) // 2)
+        self.assertEqual(body, gzip.decompress(body3))
+        code, h4, body4 = self._raw('/assets/biosense-mark.png', **{'Accept-Encoding': 'gzip'})
+        self.assertEqual(200, code)
+        self.assertNotIn('Content-Encoding', h4)
+        self.assertTrue(body4.startswith(b'\x89PNG'))
+        # The run listing every page polls is JSON, and is compressed too; the
+        # listing itself stays `no-store`, because it changes as runs run.
+        code, h5, body5 = self._raw('/api/discovery', **{'Accept-Encoding': 'gzip'})
+        self.assertEqual(200, code)
+        self.assertEqual('no-store', h5['Cache-Control'])
+        if len(body5) >= 1024 or 'Content-Encoding' in h5:
+            self.assertEqual('gzip', h5['Content-Encoding'])
+            body5 = gzip.decompress(body5)
+        self.assertIn('runs', json.loads(body5))
+
+    def test_a_finished_run_comes_back_with_results_as_the_next_round(self):
+        """The person ran the round plan; the results start round 2 from this
+        run's files, and nothing is started without results to read."""
+        from unittest import mock
+        rid = 'fedcba9876543210'
+        d = self._ended_real_run(rid)
+        code, snap = self._req('GET', f'/api/discovery/{rid}')
+        self.assertEqual(200, code, snap)
+        self.assertTrue(snap['followable'])
+        self.assertFalse(snap['continuable'], 'a finished run is followed up, not continued')
+        code, body = self._req('POST', f'/api/discovery/{rid}/follow-up', {})
+        self.assertEqual(400, code, body)
+        self.assertIn('brings results', body['error'])
+        seen = {}
+
+        class Started:
+            def snapshot(self):
+                return {'run_id': 'abcabcabcabcabca'}
+
+        def start(req, **kw):
+            seen.update(req=req, seed=kw.get('seed_from'), round=kw.get('seed_round'))
+            return Started()
+        with mock.patch.object(self.APP.Handler.discovery, 'start', side_effect=start):
+            code, body = self._req('POST', f'/api/discovery/{rid}/follow-up', {
+                'results': 'A2 GM-CSF 50 ng/mL: CD206+ 52% vs 31% control (n=3).'})
+        self.assertEqual(202, code, body)
+        cont = seen['req']['continued_from']
+        self.assertEqual(('follow_up', 2, rid), (cont['kind'], cont['round'], cont['run_id']))
+        self.assertIn('CD206+ 52%', cont['results'])
+        self.assertEqual(d, Path(seen['seed']))
+        self.assertEqual(1, seen['round'], 'round 1 goes under connected/')
+        self.assertEqual([{'run_id': rid, 'run_dir': d.name, 'round': 1}], cont['chain'])
+        K.require_valid('discovery_request', seen['req'])
+
+    def test_a_scientist_enters_results_against_the_plan_and_follows_up_with_them(self):
+        from unittest import mock
+        rid = 'abc1239876543211'
+        self._ended_real_run(rid)
+        code, body = self._req('POST', f'/api/discovery/{rid}/results', {'entries': [
+            {'arm_id': 'A9', 'replicate': 1, 'readout': 'CD14+', 'value': 40}]})
+        self.assertEqual(400, code, body)
+        code, body = self._req('POST', f'/api/discovery/{rid}/results', {'entries': [
+            {'arm_id': 'A0', 'replicate': 1, 'readout': 'CD14+', 'value': 40},
+            {'arm_id': 'A1', 'replicate': 1, 'readout': 'CD14+', 'value': 61}]})
+        self.assertEqual(200, code, body)
+        self.assertEqual(2, body['measurements']['by_source']['scientist'])
+        code, snap = self._req('GET', f'/api/discovery/{rid}')
+        self.assertEqual(2, snap['measurements']['count'], 'read fresh for an ended run')
+
+        class Started:
+            def snapshot(self):
+                return {'run_id': 'abcabcabcabcabcb'}
+        with mock.patch.object(self.APP.Handler.discovery, 'start', return_value=Started()):
+            code, body = self._req('POST', f'/api/discovery/{rid}/follow-up', {})
+        self.assertEqual(202, code, 'recorded measurements are results enough')
+
+    def test_a_synthetic_run_is_rerun_not_followed_up(self):
+        rid = '0123456789abcdef'
+        d = self._ended_real_run(rid)
+        req = json.loads((d / 'discovery_request.json').read_text())
+        req['runtime_mode'] = 'synthetic_demo'
+        (d / 'discovery_request.json').write_text(json.dumps(req))
+        code, body = self._req('POST', f'/api/discovery/{rid}/follow-up', {'results': 'x' * 20})
+        self.assertEqual(409, code, body)
+        self.assertIn('real-AI', body['error'])
+
+    def test_an_operator_adds_a_private_table_that_is_never_listed(self):
+        table = ('sample,condition,cd14_pct,viability_pct\n'
+                 's1,M-CSF,62,91\ns2,M-CSF,60,90\ns3,M-CSF,64,92\n'
+                 's4,GM-CSF+M-CSF,71,89\ns5,GM-CSF+M-CSF,73,90\ns6,GM-CSF+M-CSF,70,88\n')
+        code, d = self._req('POST', '/api/datasets/upload', {
+            'file_name': 'macs.csv', 'content': table, 'dataset_id': 'synthetic-upload-1',
+            'title': 'Synthetic test table', 'modality': 'cytometry_summary',
+            'condition_column': 'condition', 'control': 'M-CSF', 'sample_id_column': 'sample'})
+        self.assertEqual(200, code, d)
+        self.assertEqual('private', d['dataset']['visibility'])
+        self.assertEqual(['GM-CSF+M-CSF', 'M-CSF'], sorted(d['dataset']['conditions']))
+        stored = self.tmp / 'private' / 'uploads' / 'synthetic-upload-1' / 'table.csv'
+        self.assertTrue(stored.is_file(), 'kept under the private root')
+        # The listing still never names a private dataset.
+        listed = self._req('GET', '/api/datasets')[1]['datasets']
+        self.assertNotIn('synthetic-upload-1', [x['dataset_id'] for x in listed])
+        # The same id twice, a wrong type, a bad id, a design naming a missing column.
+        self.assertEqual(409, self._req('POST', '/api/datasets/upload', {
+            'file_name': 'a.csv', 'content': table, 'dataset_id': 'synthetic-upload-1'})[0])
+        self.assertEqual(400, self._req('POST', '/api/datasets/upload', {
+            'file_name': 'a.xlsx', 'content': table, 'dataset_id': 'synthetic-upload-2'})[0])
+        self.assertEqual(400, self._req('POST', '/api/datasets/upload', {
+            'file_name': 'a.csv', 'content': table, 'dataset_id': '../escape'})[0])
+        code, d = self._req('POST', '/api/datasets/upload', {
+            'file_name': 'a.csv', 'content': table, 'dataset_id': 'synthetic-upload-3',
+            'condition_column': 'no_such_column'})
+        self.assertEqual(400, code)
+        self.assertIn('no_such_column', d['error'])
+        self.assertFalse((self.tmp / 'private' / 'uploads' / 'synthetic-upload-3').exists(),
+                         'a refused table leaves nothing behind')
+
+    def test_the_system_check_runs_for_an_operator_and_reports_its_rows(self):
+        from unittest import mock
+        from biosense.production import selfcheck as SCK
+        fake = {'ok': True, 'rows': [{'id': 'sandbox', 'label': 'Agents\' sandbox',
+                                      'status': 'ok', 'detail': 'fine', 'seconds': 0.0}],
+                'sandboxed': True, 'live': False}
+        with mock.patch.object(SCK, 'run', lambda **kw: dict(fake, live=kw.get('live'))):
+            code, d = self._req('POST', '/api/admin/selfcheck', {'live': False})
+            self.assertEqual(202, code, d)
+            for _ in range(80):
+                code, d = self._req('GET', '/api/admin/selfcheck')
+                if d.get('state') == 'done':
+                    break
+                time.sleep(0.05)
+        self.assertEqual('done', d['state'])
+        self.assertTrue(d['report']['ok'])
+        self.assertEqual('sandbox', d['report']['rows'][0]['id'])
+
+    def test_a_hosted_visitor_may_not_run_the_system_check(self):
+        """The live variant spends the deployment's model credit."""
+        hosted = RT.from_env(runs_dir=self.tmp / 'runs', env={'BIOSENSE_HOSTED': '1'})
+        saved = self.APP.Handler.runtime_cfg
+        self.APP.Handler.runtime_cfg = hosted
+        try:
+            self.assertEqual(403, self._req('GET', '/api/admin/selfcheck')[0])
+            self.assertEqual(403, self._req('POST', '/api/admin/selfcheck', {'live': True})[0])
+        finally:
+            self.APP.Handler.runtime_cfg = saved
+
+    def _project(self, name):
+        code, d = self._req('POST', '/api/projects',
+                            {'name': name, 'species': 'Human', 'target_cell': 'Macrophage',
+                             'goal': 'more cells', 'quick': True, 'overwrite': True})
+        self.assertEqual(201, code, d)
+        return d['project_id']
+
+    def _run(self, project_id, objective=OBJECTIVE):
+        code, d = self._req('POST', '/api/discovery', {
+            'project_id': project_id, 'objective': objective,
+            'runtime_mode': 'synthetic_demo'})
+        self.assertEqual(202, code, d)
+        return d['run_id']
+
+    def _settle(self, rid, timeout=90):
+        for _ in range(int(timeout * 4)):
+            snap = self._req('GET', f'/api/discovery/{rid}')[1]
+            if snap['status'] not in ('queued', 'running', 'finalizing'):
+                return snap
+            time.sleep(0.25)
+        self.fail('the run never settled')
+
+    # ── deleting ───────────────────────────────────────────
+    def test_a_finished_run_is_deleted_to_the_trash_and_disappears(self):
+        pid = self._project('Delete Me Runs')
+        rid = self._run(pid)
+        self._settle(rid)
+        code, d = self._req('POST', f'/api/discovery/{rid}/delete')
+        self.assertEqual(200, code, d)
+        listed = [r['run_id'] for r in self._req('GET', '/api/discovery')[1]['runs']]
+        self.assertNotIn(rid, listed)
+        self.assertEqual(404, self._req('GET', f'/api/discovery/{rid}')[0])
+        trash = self.tmp / 'runs' / '.trash'
+        self.assertTrue(any(rid[:6] in p.name for p in trash.iterdir()),
+                        'moved, not unlinked: recoverable on the server')
+        self.assertEqual(404, self._req('POST', f'/api/discovery/{rid}/delete')[0])
+
+    def test_a_live_run_cannot_be_deleted(self):
+        from biosense.production import app as APP
+        reg = self.APP.Handler.discovery
+        run = APP.DiscoveryRun('d' * 16, {'request_id': 'r', 'project_id': 'p', 'objective': 'o'},
+                               self.tmp / 'runs' / 'ai-live-dddddd', 'synthetic_demo',
+                               owner=None)
+        with reg.lock:
+            reg.runs[run.id] = run; reg.order.append(run.id)
+        try:
+            self.assertEqual('live', reg.delete(run.id, owner=None, operator=True))
+        finally:
+            with reg.lock:
+                reg.runs.pop(run.id, None); reg.order.remove(run.id)
+
+    def test_a_project_and_its_runs_go_together_and_a_template_never(self):
+        pid = self._project('Delete Me Project')
+        rid = self._run(pid)
+        self._settle(rid)
+        code, d = self._req('POST', f'/api/projects/{pid}/delete', {'delete_runs': True})
+        self.assertEqual(200, code, d)
+        self.assertIn(rid, d['runs_deleted'])
+        ids = [p['project_id'] for p in self._req('GET', '/api/projects')[1]['projects']
+               if p.get('source') == 'workspace']
+        self.assertNotIn(pid, ids)
+        code, d = self._req('POST', '/api/projects/ipsc_macrophage/delete', {'delete_runs': True})
+        self.assertEqual(403, code)
+        self.assertIn('cannot be deleted', d['error'])
+        self.assertEqual(404, self._req('POST', '/api/projects/no_such_project/delete', {})[0])
+
+    # ── creating and selecting ──────────────────────────────
+    def test_creating_a_project_returns_the_one_to_select(self):
+        code, d = self._req('POST', '/api/projects', {
+            'name': 'Human Macrophage Optimization', 'species': 'Human',
+            'starting_cell': 'iPSC', 'target_cell': 'Macrophage',
+            'process_context': 'iPSC to macrophage',
+            'goal': 'Improve viable macrophage output', 'quick': True, 'overwrite': True})
+        self.assertEqual(201, code, d)
+        self.assertEqual('human_macrophage_optimization', d['selected'])
+        listed = self._req('GET', '/api/workspace/projects')[1]['projects']
+        self.assertIn('human_macrophage_optimization', [p['project_id'] for p in listed])
+
+    def test_a_created_project_can_actually_be_run_against(self):
+        """The gap this closes: a project could be created and selected, and then
+        every run against it refused with "no such project" — because the run
+        looked only in the committed set."""
+        pid = self._project('Runnable Project')
+        snap = self._settle(self._run(pid))
+        self.assertEqual('done', snap['status'], snap.get('error'))
+        self.assertEqual(pid, snap['project_id'])
+
+    def test_a_project_a_request_names_but_nobody_owns_is_refused(self):
+        code, d = self._req('POST', '/api/discovery/preview',
+                            {'project_id': 'no_such_project_here', 'objective': OBJECTIVE})
+        self.assertEqual(400, code)
+        self.assertTrue(d['refused'])
+
+    # ── one object, every view ──────────────────────────────
+    def test_the_run_appears_in_the_list_immediately(self):
+        pid = self._project('Instant Listing')
+        rid = self._run(pid)
+        listed = self._req('GET', '/api/discovery')[1]
+        self.assertIn(rid, [r['run_id'] for r in listed['runs']])
+
+    def test_discovery_and_runs_read_the_same_object(self):
+        pid = self._project('Same Object')
+        rid = self._run(pid)
+        self._settle(rid)
+        detail = self._req('GET', f'/api/discovery/{rid}')[1]
+        row = next(r for r in self._req('GET', '/api/discovery')[1]['runs']
+                   if r['run_id'] == rid)
+        self.assertEqual(detail['status'], row['status'])
+        self.assertEqual(detail['project_id'], row['project_id'])
+        self.assertEqual(detail['runtime_mode'], row['runtime_mode'])
+        self.assertEqual(detail['objective'], row['objective'])
+
+    def test_a_run_is_filterable_by_project_and_counted_per_project(self):
+        a, b = self._project('Project Alpha'), self._project('Project Beta')
+        ra, rb = self._run(a), self._run(b)
+        self._settle(ra), self._settle(rb)
+        only_a = self._req('GET', f'/api/discovery?project_id={a}')[1]
+        self.assertEqual([ra], [r['run_id'] for r in only_a['runs']])
+        projects = self._req('GET', '/api/workspace/projects')[1]['projects']
+        counts = {p['project_id']: p['runs'] for p in projects if 'runs' in p}
+        self.assertEqual(1, counts[a]['total'])
+        self.assertEqual(1, counts[b]['total'])
+
+    def test_the_project_detail_view_holds_the_projects_work(self):
+        pid = self._project('Detail View')
+        rid = self._run(pid)
+        self._settle(rid)
+        code, d = self._req('GET', f'/api/projects/{pid}')
+        self.assertEqual(200, code)
+        self.assertEqual(pid, d['project']['project_id'])
+        self.assertTrue(d['owned'])
+        self.assertIn(rid, [r['run_id'] for r in d['runs']])
+
+    # ── the run outlives the page ───────────────────────────
+    def test_switching_project_and_navigating_does_not_touch_a_run(self):
+        """The regression test the product asked for by name: selecting another
+        project is a view change and must have zero execution impact."""
+        pid = self._project('Keeps Running')
+        rid = self._run(pid)
+        self._project('Another Project')             # created while it runs
+        self._req('GET', '/api/discovery')           # the Runs page
+        self._req('GET', '/api/datasets')            # the Data page
+        self._req('GET', '/api/sim/config')          # the Simulator page
+        snap = self._settle(rid)
+        self.assertEqual('done', snap['status'])
+        self.assertIsNone(snap['error'])
+
+    def test_only_an_explicit_stop_cancels_a_run(self):
+        from biosense.production import app as APP
+        run = APP.DiscoveryRun('f' * 16, {'request_id': 'r', 'project_id': 'p',
+                                          'objective': 'o'},
+                               self.tmp / 'runs' / 'nowhere', 'synthetic_demo')
+        self.assertFalse(run.should_stop())
+        run.stop('cancelled', APP.STOP_MESSAGES['cancelled'])
+        self.assertTrue(run.should_stop())
+
+    def test_a_finished_run_survives_this_process_forgetting_it(self):
+        pid = self._project('Survives Restart')
+        rid = self._run(pid)
+        self._settle(rid)
+        self.APP.Handler.discovery.runs.clear()      # what a restart looks like
+        code, back = self._req('GET', f'/api/discovery/{rid}')
+        self.assertEqual(200, code)
+        self.assertTrue(back['recovered'])
+        self.assertEqual('done', back['status'])
+        listed = self._req('GET', '/api/discovery')[1]['runs']
+        self.assertIn(rid, [r['run_id'] for r in listed])
+
+    def test_events_can_be_replayed_from_where_a_client_left_off(self):
+        pid = self._project('Replay')
+        rid = self._run(pid)
+        snap = self._settle(rid)
+        self.assertGreater(snap['event_count'], 2)
+        half = snap['events'][1]['seq']
+        after = self._req('GET', f'/api/discovery/{rid}?after={half}')[1]
+        self.assertTrue(all(e['seq'] > half for e in after['events']))
+        self.assertLess(len(after['events']), len(snap['events']))
+
+    def test_a_run_carries_its_live_picture_and_its_stage_count(self):
+        pid = self._project('Live Picture')
+        snap = self._settle(self._run(pid))
+        self.assertIn('activity', snap)
+        self.assertIn('agents', snap['activity'])
+        self.assertTrue(snap['activity']['timeline'])
+        self.assertEqual({'done', 'total', 'current'}, set(snap['stage_counts']))
+        self.assertLessEqual(snap['stage_counts']['done'], snap['stage_counts']['total'])
+
+    def test_a_run_records_the_project_and_the_account_it_belongs_to(self):
+        pid = self._project('Belongs To')
+        snap = self._settle(self._run(pid))
+        self.assertEqual(pid, snap['project_id'])
+        self.assertEqual(WS.LOCAL_OWNER, snap['owner'])
+        state = json.loads((self.tmp / 'runs' / snap['run_dir'] / 'app_run.json').read_text())
+        self.assertEqual(pid, state['project_id'])
+        self.assertEqual(WS.LOCAL_OWNER, state['owner'])
+
+
+if __name__ == '__main__':
+    unittest.main()

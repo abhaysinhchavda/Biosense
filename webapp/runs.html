@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BioSense · Runs</title>
+<meta name="description" content="Every BioSense discovery run: what is working now, what finished, and what each one found. Runs are background jobs on the server — closing this page does not stop them.">
+<link rel="icon" type="image/png" href="assets/biosense-mark.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="brand.css">
+<style>
+/* The card frame the other pages give their cards; this page never had it, so
+   every title and paragraph sat against the card's edge. */
+.card{padding:20px 22px}
+.card > .head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+  flex-wrap:wrap;margin-bottom:12px}
+.card h3{font-size:16.5px}
+.card .hint{font-size:13.5px;color:var(--ink-3);font-weight:400;letter-spacing:0}
+.caveat{font-size:12.5px;line-height:1.55;color:var(--ink-3);margin:8px 0 0;max-width:78ch}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.foot{margin-top:18px;font-size:12.5px;color:var(--ink-3)}
+#trashEmpty{margin-left:0}
+.card select{font:inherit;font-size:14px;padding:7px 11px;border-radius:9px;
+  border:1px solid var(--line);background:var(--glass-2);color:var(--ink)}
+.runs{display:flex;flex-direction:column;gap:14px;margin-top:4px}
+.grp{margin-top:6px}
+.grp > h3{font-size:13px;font-family:var(--mono);letter-spacing:.09em;text-transform:uppercase;
+  color:var(--ink-3);margin:18px 0 10px;display:flex;align-items:center;gap:10px}
+.grp > h3 .n{font-weight:700;color:var(--ink-2)}
+.run{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 18px;padding:14px 16px;
+  border:1px solid var(--line);border-radius:13px;background:var(--glass-2);cursor:pointer}
+.run:hover{border-color:color-mix(in srgb,var(--brand) 45%,var(--line))}
+.run .obj{font-size:15px;font-weight:600;line-height:1.4}
+.run .meta{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px 16px;font-size:12.5px;
+  color:var(--ink-3);font-family:var(--mono)}
+.run .right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;white-space:nowrap}
+/* Each part has its place. A named run carries its objective as a second line,
+   and left to auto-placement that line took the status column — the name was
+   squeezed to a word per line and the status pill pushed out of the card. */
+.run .obj{grid-column:1;grid-row:1;min-width:0}
+.run .run-obj{grid-column:1;grid-row:2;min-width:0;display:-webkit-box;-webkit-line-clamp:2;
+  -webkit-box-orient:vertical;overflow:hidden}
+.run .right{grid-column:2;grid-row:1 / span 2;align-self:start}
+.run .hyp{grid-column:1/-1;font-size:13.5px;color:var(--ink-2);margin-top:2px}
+.empty{color:var(--ink-3);font-size:14px;padding:18px 0}
+.trash-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 16px;align-items:center;
+  padding:12px 14px;border:1px solid var(--line);border-radius:13px;background:var(--glass-2)}
+.trash-row .obj{font-size:14.5px;font-weight:600;line-height:1.4;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.trash-row .meta{grid-column:1;font-size:12px;color:var(--ink-3);font-family:var(--mono)}
+.trash-row .acts{grid-column:2;grid-row:1/span 2;display:flex;gap:8px;align-items:center}
+.trash-row .kind{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--ink-3);margin-right:8px}
+@media (max-width:40rem){.trash-row{grid-template-columns:1fr}
+  .trash-row .acts{grid-column:1;grid-row:auto}}
+</style>
+</head>
+<body>
+<div class="bg" aria-hidden="true"><span></span><span></span></div>
+<div class="wrap">
+
+<header class="bar">
+  <div class="brand">
+    <img src="assets/biosense-mark.png" alt="">
+    <div>
+      <div class="nm">BioSense<span>AI</span></div>
+      <div class="sub">Agentic orchestration</div>
+    </div>
+  </div>
+  <nav class="modes" aria-label="Section">
+    <a href="console.html">AI Discovery</a>
+    <a href="runs.html" aria-current="page">Runs</a>
+    <a href="simulator.html">Simulator</a>
+    <a href="data.html">Data</a>
+    <a href="loop.html">Quick loop</a>
+    <a href="index.html">Loop tracker</a>
+  </nav>
+  <div class="spacer"></div>
+  <span id="runbeacon" hidden></span>
+  <span id="identity" class="row" style="margin:0;gap:8px"></span>
+  <button class="btn" id="theme" title="Switch light / dark">Theme</button>
+</header>
+
+<section class="glass card">
+  <div class="head">
+    <h3>Runs</h3>
+    <span class="hint" id="scope"></span>
+  </div>
+  <p class="caveat">Every discovery run you have started. A run is a background job on the
+    server: closing this page, switching project or losing the network observes less of it —
+    none of them stops it. Only <b>Stop run</b> does.</p>
+  <div class="row" style="margin-top:12px">
+    <select id="projectFilter" style="max-width:22rem"></select>
+    <span class="dim" id="counts"></span>
+  </div>
+  <div class="runs" id="runs"><p class="empty">Loading…</p></div>
+</section>
+
+<section class="glass card detail" id="detailCard" hidden>
+  <div class="head">
+    <h3 id="detailTitle">Run</h3>
+    <span class="hint" id="detailHint"></span>
+  </div>
+  <div id="detail"></div>
+</section>
+
+<!-- What was deleted: kept, restorable, until its owner removes it for good. -->
+<section class="glass card" id="trashCard">
+  <div class="head">
+    <h3>Trash</h3>
+    <span class="hint" id="trashHint"></span>
+  </div>
+  <p class="caveat">Deleting a run or a project moves it here: it is no longer listed or
+    served, and nothing in it is lost. <b>Restore</b> puts it back as it was.
+    <b>Delete forever</b> removes its files from this server's storage — that frees the space
+    and cannot be undone.</p>
+  <div class="row" style="margin-top:12px">
+    <button class="btn stop" id="trashEmpty" type="button" hidden>Empty trash</button>
+    <span class="dim" id="trashMsg"></span>
+  </div>
+  <div class="runs" id="trashList"><p class="empty">Loading…</p></div>
+</section>
+
+<!-- Operators only: the server answers 403 to anyone else, and the card stays hidden. -->
+<section class="glass card" id="syscheckCard" hidden>
+  <div class="head">
+    <h3>System check</h3>
+    <span class="hint">does a prompt have everything it needs to become a protocol?</span>
+  </div>
+  <p class="caveat">Runs the chain the agents depend on, as they run it: the sandbox, the agent
+    bundle, every command the brief names, the bioinformatics tools, the simulator, the
+    hypothesis and context builders, the protocol and the stand-in bioreactor loop — on
+    SYNTHETIC fixtures, in a few seconds, with no model. The live check also starts a real
+    session in which the orchestrator asks a specialist to run a tool, and spends model
+    credit.</p>
+  <div class="row" style="margin-top:12px">
+    <button class="btn go" id="syscheckRun" type="button">Run system check</button>
+    <button class="btn" id="syscheckLive" type="button">Run live check (spends credit)</button>
+    <span class="dim" id="syscheckState"></span>
+  </div>
+  <div id="syscheckRows" style="margin-top:12px"></div>
+</section>
+
+<footer class="foot">
+  <span>BioSense · runs are durable server-side jobs</span>
+</footer>
+</div>
+<script src="runstate.js"></script>
+<script src="runview.js"></script>
+<script src="runs.js"></script>
+</body>
+</html>

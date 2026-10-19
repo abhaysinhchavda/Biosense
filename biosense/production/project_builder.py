@@ -1,0 +1,846 @@
+"""Making a project: the bioreactor it shares, and the biology it does not.
+
+Every stirred-tank process in this system turns the same vessel controls. An iPSC
+to macrophage run and a CAR-T expansion both have an impeller, a dissolved-oxygen
+setpoint, a feed schedule and a seeding density, and those mean the same thing in
+both — which is why they are the **universal** set here, offered to every new
+project with the canonical registry's own bounds.
+
+What is not shared is the biology. M-CSF belongs to a myeloid process and IL-7 to
+a T-lineage one, and offering a CAR-T scientist an M-CSF slider because
+macrophages needed one implies the model knows something about it. So a project
+adds its own parameters, and each one arrives with a declared relationship to the
+simulator:
+
+    not_modelled      a real design and evidence variable with no equation. The
+                      honest default, and the only one that needs no justifying.
+    de_novo_ai        a response an agent proposed from cited claims. It predicts,
+                      and every number it produces is uncalibrated and says so.
+    expert_declared   the same, supplied by a person from their own experience.
+                      Expert knowledge: private, not citable, a design choice.
+
+A fourth kind, `modelled`, cannot be created here at all. That one means the
+project's calibrated model has a fitted term, which is a property of the model
+and not something a form can confer. `from_template` carries the committed
+macrophage profile's modelled parameters across unchanged, because there the
+claim is already true.
+
+Nothing in this module writes into the repository's `projects/` directory. A
+project a person makes belongs to their workspace, under the private data root.
+"""
+from __future__ import annotations
+
+import re
+
+from .. import contracts as K
+from .. import parameters as PR
+from .. import projects as PJ
+from .. import workspace as WS
+
+PROJECT_ID = re.compile(r'^[a-z][a-z0-9_]{2,63}$')
+STAGE_ID = re.compile(r'^[a-z][a-z0-9_]{1,31}$')
+MAX_STAGES = 12
+MAX_PARAMETERS = 48
+MAX_READOUTS = 12
+
+# The vessel controls every stirred-tank process has. Same canonical id, same
+# meaning, same registry bounds, whatever the cells are. A new project gets these
+# offered by default; it may decline any of them, because a process without a
+# feed schedule should not carry a feed slider.
+UNIVERSAL_BIOREACTOR = (
+    'seed_density', 'agitation_rpm', 'do_setpoint', 'feed_fraction', 'feed_interval_h',
+    'temperature_c', 'stage_duration_days',
+)
+# Those of the above that the committed iPSC->monocyte model actually has a term
+# for. Used only when a project is built on that model; a project with its own
+# model or none gets no `modelled` claim from this module.
+IPSC_MONOCYTE_KNOBS = {
+    'seed_density': 'seed_density', 'agitation_rpm': 'agitation_rpm',
+    'do_setpoint': 'do_setpoint', 'feed_fraction': 'feed_fraction',
+    'feed_interval_h': 'feed_interval_h', 'rocki_hours': 'rocki_hours',
+    'bmp4_ng_ml': 'bmp4', 'vegf_ng_ml': 'vegf', 'mcsf_ng_ml': 'mcsf', 'il3_ng_ml': 'il3',
+}
+CREATABLE_COVERAGE = ('not_modelled', 'de_novo_ai', 'expert_declared')
+
+DEFAULT_READOUTS = (
+    {'readout_id': 'target_cell_yield', 'label': 'Target cells per input cell',
+     'unit': 'cells/input_cell', 'kind': 'yield', 'higher_is_better': True,
+     'simulator_metric': None},
+    {'readout_id': 'viability', 'label': 'Final viability', 'unit': '%',
+     'kind': 'viability', 'higher_is_better': True, 'simulator_metric': None},
+    {'readout_id': 'identity_purity', 'label': 'Identity marker purity', 'unit': '%',
+     'kind': 'identity', 'higher_is_better': True, 'simulator_metric': None},
+)
+READOUT_KINDS = ('yield', 'viability', 'identity', 'phenotype', 'purity', 'stress',
+                 'exhaustion', 'metabolic', 'physical', 'process')
+
+
+def universal_parameters():
+    """The shared bioreactor set, as the interface offers it.
+
+    Read from the canonical registry rather than restated, so a bound only ever
+    exists in one place and a project that narrows it has to say why.
+    """
+    out = []
+    for pid in UNIVERSAL_BIOREACTOR:
+        p = PR.BY_ID[pid]
+        out.append({
+            'parameter_id': pid, 'label': p.label, 'unit': p.unit, 'meaning': p.meaning,
+            'value_type': p.value_type, 'global_min': p.global_min, 'global_max': p.global_max,
+            'stages': list(p.stages), 'universal': True,
+            'modelled_by_ipsc_monocyte': pid in IPSC_MONOCYTE_KNOBS,
+        })
+    return out
+
+
+def catalogue():
+    """Every canonical parameter, split into the shared set and the rest.
+
+    The rest are not "extra": they are the biology-specific knobs a project picks
+    from, or extends. Shown with their meanings so the person choosing knows what
+    they are selecting rather than recognising an abbreviation.
+    """
+    universal = universal_parameters()
+    uids = {r['parameter_id'] for r in universal}
+    specific = []
+    for p in PR.PARAMETERS:
+        if p.parameter_id in uids:
+            continue
+        specific.append({
+            'parameter_id': p.parameter_id, 'label': p.label, 'unit': p.unit,
+            'meaning': p.meaning, 'value_type': p.value_type,
+            'global_min': p.global_min, 'global_max': p.global_max,
+            'stages': list(p.stages), 'universal': False,
+            'modelled_by_ipsc_monocyte': p.parameter_id in IPSC_MONOCYTE_KNOBS,
+        })
+    return {
+        'universal': universal,
+        'process_specific': specific,
+        'coverage_options': [
+            {'value': 'not_modelled',
+             'label': 'Design variable only',
+             'blurb': 'Real and usable in the lab; no prediction is produced for it. The '
+                      'honest default.'},
+            {'value': 'de_novo_ai',
+             'label': 'AI-proposed response (de novo)',
+             'blurb': 'The discovery agents propose how it behaves from cited evidence. It '
+                      'predicts, and every number is uncalibrated and labelled DE NOVO.'},
+            {'value': 'expert_declared',
+             'label': 'You describe how it behaves',
+             'blurb': 'You supply the shape and the numbers from your own experience. Private '
+                      'expert knowledge: it predicts, and a value resting on it is a design '
+                      'choice, never a cited one.'},
+        ],
+        'note': 'The universal set is the vessel: the same controls, meaning the same things, '
+                'in every project. The process-specific set is the biology, and a project only '
+                'has what it declares.',
+    }
+
+
+def _stage(raw, index):
+    sid = (raw.get('stage_id') or '').strip().lower().replace(' ', '_')
+    if not STAGE_ID.match(sid):
+        raise K.ContractError(
+            f'stage {index + 1}: a stage id is lower-case letters, digits and underscores, '
+            f'2 to 32 characters; got {raw.get("stage_id")!r}')
+    return {'stage_id': sid, 'label': (raw.get('label') or sid.replace('_', ' ').title()),
+            'default_days': raw.get('default_days'), 'min_days': raw.get('min_days'),
+            'max_days': raw.get('max_days'), 'wants': raw.get('wants')}
+
+
+def _parameter(raw, *, stage_ids, simulator_status, model_knobs):
+    pid = PR.resolve(raw['parameter_id'])
+    p = PR.BY_ID[pid]
+    stage = (raw.get('stage') or 'all').strip()
+    if stage not in stage_ids and stage != 'all':
+        raise K.ContractError(
+            f'{pid} names stage {stage!r}, which this project does not have '
+            f'({", ".join(sorted(stage_ids))})')
+    coverage = raw.get('simulator_coverage') or 'not_modelled'
+    if coverage == 'modelled' and simulator_status != 'current':
+        # Downgrading this silently would answer "make it modelled" with
+        # "fine" and then quietly not do it.
+        raise K.ContractError(
+            f'{PR.resolve(raw["parameter_id"])} cannot be marked "modelled": this project has '
+            f'no calibrated model to have a term in it. Choose "design variable only", or have '
+            f'the response proposed or declared.')
+    if simulator_status == 'none' and coverage not in PJ.UNCALIBRATED:
+        # No calibrated model: an ordinary parameter is simply not predicted.
+        # A proposed response survives, because it is the thing that lets a brand
+        # new process say anything at all about a dose.
+        coverage = 'no_simulator'
+    elif coverage == 'modelled':
+        # Only a knob the calibrated model genuinely has may claim this, and the
+        # mapping has to exist. A form cannot talk a model into having a term.
+        if pid not in model_knobs:
+            raise K.ContractError(
+                f'{pid} cannot be marked "modelled": the calibrated model has no term for it. '
+                f'Choose "design variable only", or have the response proposed or declared.')
+    elif coverage not in CREATABLE_COVERAGE:
+        raise K.ContractError(
+            f'{pid}: simulator_coverage must be one of {CREATABLE_COVERAGE} '
+            f'(or "modelled" for a knob the calibrated model already has)')
+
+    out = {'parameter_id': pid, 'stage': stage, 'simulator_coverage': coverage}
+    for key in ('display_name', 'default_value', 'minimum', 'maximum', 'step', 'notes'):
+        if raw.get(key) is not None:
+            out[key] = raw[key]
+    if raw.get('editable') is not None:
+        out['editable'] = bool(raw['editable'])
+    if coverage == 'modelled':
+        out['simulator_mapping'] = model_knobs[pid]
+    if raw.get('bound_origin'):
+        out['bound_origin'] = raw['bound_origin']
+    # A narrowed bound needs an origin. Supply the person's own statement rather
+    # than refusing, when they gave one; refuse when they did not, which is what
+    # Project's own validation would do a moment later anyway.
+    lo, hi = out.get('minimum'), out.get('maximum')
+    narrowed = ((lo is not None and p.global_min is not None and lo > p.global_min)
+                or (hi is not None and p.global_max is not None and hi < p.global_max))
+    if narrowed and not out.get('bound_origin'):
+        raise K.ContractError(
+            f'{pid}: this project narrows the range to [{lo}, {hi}] but says nothing about '
+            f'where the limit comes from. Name it — equipment, safety, literature, an internal '
+            f'experiment or a design choice — because a bound with no origin is a guess '
+            f'wearing the clothes of a constraint.')
+    if coverage in PJ.UNCALIBRATED:
+        out['response_model'] = _response_model(raw.get('response_model'), pid, coverage)
+    return out
+
+
+def _response_model(rm, pid, coverage):
+    if not rm:
+        raise K.ContractError(
+            f'{pid}: you asked for a prediction from a proposed response, so the response has '
+            f'to say what it is — a shape, its constants, what it acts on, and why.')
+    origin = 'ai_proposed' if coverage == 'de_novo_ai' else 'expert_declared'
+    out = {
+        'shape': rm.get('shape'), 'target': rm.get('target'),
+        'stage': rm.get('stage'), 'optimum': rm.get('optimum'),
+        'tolerance': rm.get('tolerance'), 'half_max': rm.get('half_max'),
+        'threshold': rm.get('threshold'), 'slope': rm.get('slope'),
+        'max_effect': rm.get('max_effect'),
+        'origin': origin, 'basis': (rm.get('basis') or '').strip(),
+        'references': list(rm.get('references') or []),
+        'proposed_by': rm.get('proposed_by'), 'proposed_at': rm.get('proposed_at') or K.now_iso(),
+        'calibrated': False,
+        'evidence_status': rm.get('evidence_status'),
+    }
+    return {k: v for k, v in out.items() if v is not None or k in (
+        'stage', 'optimum', 'tolerance', 'half_max', 'threshold', 'slope', 'evidence_status',
+        'proposed_by')}
+
+
+def build(*, project_id, name, biological_system, stages, parameters, readouts=None,
+          simulator=None, description=None, version='0.1.0', limitations=None,
+          template_of=None):
+    """A validated ProjectProfile. Refuses rather than guessing.
+
+    The returned document is checked twice: against the schema, and by loading it
+    as a `Project`, which is where the bound, coverage and response-model rules
+    live. A profile that would not load is never written.
+    """
+    pid = (project_id or '').strip().lower().replace(' ', '_').replace('-', '_')
+    if not PROJECT_ID.match(pid):
+        raise K.ContractError(
+            'a project id is lower-case letters, digits and underscores, 3 to 64 characters')
+    if len((name or '').strip()) < 3:
+        raise K.ContractError('a project needs a name of at least 3 characters')
+    if not stages:
+        raise K.ContractError('a project needs at least one stage: a process happens in order')
+    if len(stages) > MAX_STAGES:
+        raise K.ContractError(f'{len(stages)} stages; the limit is {MAX_STAGES}')
+    if len(parameters or []) > MAX_PARAMETERS:
+        raise K.ContractError(f'{len(parameters)} parameters; the limit is {MAX_PARAMETERS}')
+
+    sim = dict(simulator or {'model_id': None, 'status': 'none'})
+    sim.setdefault('status', 'none' if not sim.get('model_id') else 'current')
+    if sim['status'] == 'none':
+        sim.setdefault('not_modelled_note',
+                       'This project has no mechanistic model. Its parameters are real design '
+                       'variables; nothing here predicts what they would do, and no other '
+                       "project's model is borrowed.")
+    model_knobs = IPSC_MONOCYTE_KNOBS if sim.get('model_id') == 'ipsc_monocyte_v1' else {}
+
+    stage_docs = [_stage(s, i) for i, s in enumerate(stages)]
+    stage_ids = {s['stage_id'] for s in stage_docs}
+    if len(stage_ids) != len(stage_docs):
+        raise K.ContractError('two stages share an id; a stage is named once')
+
+    seen, param_docs = set(), []
+    for raw in parameters or []:
+        doc = _parameter(raw, stage_ids=stage_ids, simulator_status=sim['status'],
+                         model_knobs=model_knobs)
+        if doc['parameter_id'] in seen:
+            raise K.ContractError(
+                f'{doc["parameter_id"]} is listed twice. One project, one definition of a knob.')
+        seen.add(doc['parameter_id'])
+        param_docs.append(doc)
+
+    reads = [dict(r) for r in (readouts or DEFAULT_READOUTS)]
+    if len(reads) > MAX_READOUTS:
+        raise K.ContractError(f'{len(reads)} readouts; the limit is {MAX_READOUTS}')
+    for r in reads:
+        if r.get('kind') not in READOUT_KINDS:
+            raise K.ContractError(
+                f'readout {r.get("readout_id")!r}: say what kind of measurement it is — one of '
+                f'{", ".join(READOUT_KINDS)}. A readout with no kind cannot be grouped with the '
+                f'ones it belongs beside.')
+        # A readout a project's model does not produce gets no simulator metric,
+        # whatever was asked for: that is how a project ends up showing a
+        # prediction for something nothing computed.
+        if sim['status'] != 'current':
+            r['simulator_metric'] = None
+
+    limits = list(limitations or [])
+    if any(p['simulator_coverage'] in PJ.UNCALIBRATED for p in param_docs):
+        limits.append(
+            'Some parameters predict through a response that was proposed rather than fitted to '
+            'data. Those predictions show what the proposal implies and are not calibrated.')
+    if sim['status'] == 'none':
+        limits.append('No mechanistic model: this project produces no simulated prediction.')
+    limits.append('A project profile records what a process has and what is known about it. It '
+                  'is not a validated manufacturing process and no part of it is approved.')
+
+    doc = {
+        'schema_version': K.PRODUCTION_VERSION,
+        'project_id': pid, 'name': name.strip(), 'version': version,
+        'created_at': K.now_iso(), 'description': description,
+        'template_of': template_of,
+        'biological_system': biological_system,
+        'stages': stage_docs, 'parameters': param_docs, 'readouts': reads,
+        'simulator': sim, 'limitations': sorted(set(limits)),
+    }
+    K.require_valid('project_profile', doc)
+    PJ.Project(doc)          # the rules that live in the loader, not the schema
+    return doc
+
+
+def from_template(template_id, *, project_id, name, biological_system=None,
+                  description=None, templates_dir=None):
+    """A new project starting from a committed profile.
+
+    Everything is carried across, `modelled` claims included, because they were
+    true of that model and the new project runs the same one. The id, the name
+    and the biological system are the person's.
+    """
+    base = PJ.load(template_id, templates_dir)
+    doc = dict(base.doc)
+    doc['project_id'] = (project_id or '').strip().lower().replace(' ', '_').replace('-', '_')
+    doc['name'] = (name or '').strip()
+    doc['created_at'] = K.now_iso()
+    doc['template_of'] = base.project_id
+    doc['version'] = '0.1.0'
+    if description is not None:
+        doc['description'] = description
+    if biological_system:
+        doc['biological_system'] = biological_system
+    if not PROJECT_ID.match(doc['project_id']):
+        raise K.ContractError(
+            'a project id is lower-case letters, digits and underscores, 3 to 64 characters')
+    if len(doc['name']) < 3:
+        raise K.ContractError('a project needs a name of at least 3 characters')
+    K.require_valid('project_profile', doc)
+    PJ.Project(doc)
+    return doc
+
+
+def templates(directory=None):
+    """The committed profiles, as starting points."""
+    out = []
+    for p in PJ.load_all(directory):
+        d = p.summary()
+        out.append({'project_id': p.project_id, 'name': p.name, 'version': p.version,
+                    'description': p.doc.get('description'),
+                    'biological_system': d['biological_system'],
+                    'stages': d['stages'], 'parameter_count': len(p.parameter_ids),
+                    'has_simulator': bool(p.simulator.get('model_id')),
+                    'modelled': d['modelled']})
+    return out
+
+
+# ── storage: a workspace's own projects ─────────────────────────────────
+def save(identity, doc, *, overwrite=False):
+    """Write a project into its owner's workspace. Never into the repository."""
+    d = WS.projects_dir(identity, create=True)
+    path = d / f'{doc["project_id"]}.json'
+    if path.exists() and not overwrite:
+        raise K.ContractError(
+            f'you already have a project called {doc["project_id"]!r}. Give this one another '
+            f'id, or open the existing one.')
+    WS.assert_owned(identity, path)
+    K.write_json_atomic(path, doc)
+    return path
+
+
+def delete(identity, project_id):
+    """Move a workspace's own project into its trash. Templates cannot be deleted.
+
+    Moved rather than unlinked, for the same reason as a run: a mistaken click
+    should be recoverable by whoever runs the server.
+    """
+    path = WS.assert_owned(identity, WS.projects_dir(identity) / f'{project_id}.json')
+    if not path.is_file():
+        raise K.ContractError(f'no project {project_id!r} in this workspace')
+    bin_ = WS.workspace_root(identity) / '.trash' / 'projects'
+    bin_.mkdir(parents=True, exist_ok=True)
+    import time as _time
+    path.rename(bin_ / f'{project_id}-{_time.strftime("%Y%m%d-%H%M%S")}.json')
+    return True
+
+
+def _project_bin(identity):
+    return WS.workspace_root(identity) / '.trash' / 'projects'
+
+
+def trashed_projects(identity):
+    """This workspace's deleted projects, newest first."""
+    from . import run_store as RS
+    bin_ = _project_bin(identity)
+    if not bin_.is_dir():
+        return []
+    rows = []
+    for p in bin_.glob('*.json'):
+        if p.is_symlink() or not RS._TRASHED.match(p.stem):
+            continue
+        try:
+            doc = K.read_json(p)
+        except (OSError, ValueError):
+            doc = {}
+        rows.append({'trash_id': p.stem, 'kind': 'project',
+                     'project_id': RS._TRASHED.match(p.stem).group('name'),
+                     'name': (doc or {}).get('name'), 'deleted_at': RS.trashed_at(p.stem),
+                     'bytes': p.stat().st_size})
+    rows.sort(key=lambda r: r['deleted_at'] or 0, reverse=True)
+    return rows
+
+
+def _trashed_project(identity, trash_id):
+    from . import run_store as RS
+    if not RS._TRASHED.match(trash_id or ''):
+        return None
+    p = _project_bin(identity) / f'{trash_id}.json'
+    if p.is_symlink() or not p.is_file():
+        return None
+    WS.assert_owned(identity, p)
+    return p
+
+
+def restore_project(identity, trash_id):
+    """Put a deleted project back in the workspace. Returns its id, or None."""
+    from . import run_store as RS
+    p = _trashed_project(identity, trash_id)
+    if p is None:
+        return None
+    pid = RS._TRASHED.match(trash_id).group('name')
+    dst = WS.projects_dir(identity, create=True) / f'{pid}.json'
+    if dst.exists():
+        raise K.ContractError(f'a project {pid!r} already exists in this workspace; it was not '
+                              f'overwritten')
+    p.rename(dst)
+    return pid
+
+
+def purge_project(identity, trash_id):
+    """Remove a deleted project for good. Returns the bytes freed, or None."""
+    p = _trashed_project(identity, trash_id)
+    if p is None:
+        return None
+    freed = p.stat().st_size
+    p.unlink()
+    return freed
+
+
+def workspace_projects(identity):
+    """The projects this workspace owns. Templates are listed separately."""
+    d = WS.projects_dir(identity)
+    if not d.is_dir():
+        return []
+    out = []
+    for path in sorted(d.glob('*.json')):
+        try:
+            out.append(PJ.Project(K.read_json(path)))
+        except (K.ContractError, ValueError, OSError):
+            continue
+    return out
+
+
+def check_project_id(project_id):
+    """A project id, or a refusal. The id is a name and never a path.
+
+    Both loaders build a filename from it, and the template loader reads from a
+    directory outside the workspace — so without this an id containing `..`
+    walks out of the caller's workspace and reads somebody else's project. The
+    same pattern a project is created under is the one it is loaded under.
+    """
+    pid = (project_id or '').strip()
+    if not PROJECT_ID.match(pid):
+        raise K.ContractError(
+            f'{project_id!r} is not a project id. An id is lower-case letters, digits and '
+            f'underscores, 3 to 64 characters, starting with a letter — it is a name, not '
+            f'a path.')
+    return pid
+
+
+def load_for(identity, project_id, *, templates_dir=None):
+    """A project by id: the workspace's own first, then the committed templates.
+
+    Own first, deliberately: a person who makes a project named after a template
+    means theirs.
+    """
+    project_id = check_project_id(project_id)
+    d = WS.projects_dir(identity)
+    path = d / f'{project_id}.json'
+    if path.is_file():
+        WS.assert_owned(identity, path)
+        return PJ.Project(K.read_json(path))
+    return PJ.load(project_id, templates_dir)
+
+
+def available_for(identity, *, templates_dir=None):
+    """Every project this workspace may open, with where each came from."""
+    rows = []
+    for p in workspace_projects(identity):
+        rows.append({'project_id': p.project_id, 'name': p.name, 'version': p.version,
+                     'source': 'workspace', 'owned': True,
+                     'has_simulator': bool(p.simulator.get('model_id')),
+                     'template_of': p.doc.get('template_of')})
+    own = {r['project_id'] for r in rows}
+    for p in PJ.load_all(templates_dir):
+        if p.project_id in own:
+            continue
+        rows.append({'project_id': p.project_id, 'name': p.name, 'version': p.version,
+                     'source': 'template', 'owned': False,
+                     'has_simulator': bool(p.simulator.get('model_id')),
+                     'template_of': None})
+    return rows
+
+
+# ── the lightweight create ──────────────────────────────────────────────
+# A scientist starting work has a cell type, a goal and a process in mind. They
+# do not yet have a stage list, a parameter set or a readout table, and
+# demanding those before a project can exist is how a "create project" button
+# becomes a form nobody finishes.
+#
+# So `quick_build` asks for what somebody actually knows on day one and supplies
+# the rest from the shared vessel: the universal bioreactor stages everyone has,
+# the universal parameter set, the default readouts. Everything it supplies is
+# the same in every project and carries no biological claim — which is exactly
+# why it is safe to default. What it will NOT default is biology: no simulator,
+# no modelled parameter, no invented cell-type-specific knob. The project is
+# created with `no_simulator` coverage and says so.
+QUICK_STAGES = (
+    {'stage_id': 'expansion', 'label': 'Expansion',
+     'purpose': 'Grow the starting population.', 'default_days': 7},
+    {'stage_id': 'differentiation', 'label': 'Differentiation',
+     'purpose': 'Drive the starting population toward the target cell.', 'default_days': 10},
+    {'stage_id': 'maturation', 'label': 'Maturation / harvest',
+     'purpose': 'Mature, characterise and harvest the product.', 'default_days': 5},
+)
+
+
+def quick_build(*, project_id, name, species=None, starting_cell=None, target_cell=None,
+                cell_state=None, process_context=None, goal=None, description=None,
+                template_of=None, parameters=None):
+    """A real project from the few things somebody knows when they start one.
+
+    Everything here is durable the moment it is saved: this returns the same
+    validated ProjectProfile `build` does, with the shared vessel filled in and
+    the biology left to the person.
+    """
+    bio = {
+        'species': (species or '').strip() or 'unspecified',
+        'starting_cell': (starting_cell or '').strip() or 'unspecified starting population',
+        'target_cell': (target_cell or '').strip() or 'unspecified target population',
+    }
+    if (cell_state or '').strip():
+        bio['target_subtype'] = cell_state.strip()
+    if (process_context or '').strip():
+        bio['culture_format'] = process_context.strip()
+    goal = (goal or '').strip()
+    note = (description or '').strip() or None
+    if goal:
+        note = f'Goal: {goal}' + (f'\n\n{note}' if note else '')
+    chosen = list(parameters or [])
+    if not chosen:
+        chosen = [{'parameter_id': p['parameter_id'], 'stages': p['stages'] or ['expansion'],
+                   'simulator_coverage': 'not_modelled'}
+                  for p in universal_parameters()]
+    stages = [dict(st) for st in QUICK_STAGES]
+    stage_ids = {st['stage_id'] for st in stages}
+    for row in chosen:
+        row['stages'] = [s for s in (row.get('stages') or []) if s in stage_ids] or ['expansion']
+    return build(project_id=project_id, name=name, biological_system=bio,
+                 stages=stages, parameters=chosen, description=note,
+                 template_of=template_of,
+                 limitations=['Created from the lightweight project form: the stages and the '
+                              'shared bioreactor parameters are defaults, not a description of '
+                              'a validated process. Nothing about this project\'s biology was '
+                              'inferred.'])
+
+
+# ── a candidate lever, registered into a person's own project ───────────
+def _slug_id(label, unit):
+    base = re.sub(r'[^a-z0-9]+', '', (label or '').lower())
+    tail = re.sub(r'[^a-z0-9]+', '_', (unit or '').lower()).strip('_')
+    pid = f'{base}_{tail}' if tail else base
+    if pid and not pid[0].isalpha():
+        pid = 'p' + pid
+    return pid[:48]
+
+
+def add_parameter(identity, project_id, spec, *, registered_by=None, from_run=None):
+    """Add a lever a hypothesis named to this workspace's copy of a project.
+
+    A template is copied into the workspace under the same id first (which is
+    what `load_for` then opens), so the shipped template is never edited. A
+    name that is already a canonical parameter is added as that parameter; a
+    new one is defined for this project only, with no global bounds, and says
+    who registered it and from which run. Nothing sets a value: the range a
+    person gives bounds what a hypothesis may propose, and the protocol takes
+    the value from the hypothesis or leaves a gap.
+
+    Returns (doc, parameter_id, how) where how is 'canonical' or 'local'.
+    """
+    project = load_for(identity, project_id)
+    doc = _editable(project.doc)
+    pid, how, row = _add_row(doc, spec, registered_by=registered_by, from_run=from_run)
+    rm = spec.get('response_model')
+    if rm:
+        row.update(_declared(rm, pid, registered_by))
+    doc['parameters'].append(row)
+    _bump(doc)
+    PJ.Project(doc)                     # validated before anything is written
+    save(identity, doc, overwrite=True)
+    return doc, pid, how
+
+
+def set_stage_days(identity, project_id, stage_id, days, *, changed_by=None):
+    """How long a stage runs, in this workspace's copy of the project.
+
+    A stage length was a fixed property of the profile, so every plan drew the
+    same day ranges whatever the system actually does — and a person looking at
+    "d0–7" had no way to say "ours is ten days". It is a number about their
+    process, so they set it, inside the bounds the profile declares.
+
+    Returns (doc, stage). The project is copied into the workspace first, so a
+    committed template is never edited.
+    """
+    project = load_for(identity, project_id)
+    doc = _editable(project.doc)
+    doc['stages'] = [dict(st) for st in doc['stages']]
+    stage = next((st for st in doc['stages'] if st['stage_id'] == stage_id), None)
+    if stage is None:
+        raise K.ContractError(
+            f'{project_id} has no stage {stage_id!r}; its stages are '
+            f'{", ".join(st["stage_id"] for st in doc["stages"])}')
+    try:
+        value = float(days)
+    except (TypeError, ValueError):
+        raise K.ContractError(f'a stage length is a number of days; got {days!r}') from None
+    if not 0 < value <= 365:
+        raise K.ContractError(f'{value} days is not a stage length anybody runs')
+    lo, hi = stage.get('min_days'), stage.get('max_days')
+    if lo is not None and value < lo:
+        raise K.ContractError(
+            f'{stage_id}: {value:g} days is below this stage\'s minimum of {lo:g}. The bound '
+            f'is part of the project; change it there if the process really is shorter.')
+    if hi is not None and value > hi:
+        raise K.ContractError(
+            f'{stage_id}: {value:g} days is above this stage\'s maximum of {hi:g}. The bound '
+            f'is part of the project; change it there if the process really is longer.')
+    stage['default_days'] = value
+    _bump(doc)
+    PJ.Project(doc)                     # validated before anything is written
+    save(identity, doc, overwrite=True)
+    return doc, stage
+
+
+def _editable(doc):
+    """A copy of a profile whose parameter lists can be changed without touching the original."""
+    out = dict(doc)
+    out['parameters'] = [dict(p) for p in doc['parameters']]
+    out['local_parameters'] = [dict(p) for p in doc.get('local_parameters') or []]
+    return out
+
+
+def _add_row(doc, spec, *, registered_by=None, from_run=None):
+    """The parameter row a new lever would have, and its local definition, on *doc*.
+
+    Pure apart from *doc*: adds the local definition where the lever is not a
+    canonical parameter, and returns (parameter_id, how, row) for the caller to
+    append, decorate and validate. Nothing is saved here.
+    """
+    label = str(spec.get('label') or '').strip()
+    unit = str(spec.get('unit') or '').strip()
+    raw_id = str(spec.get('parameter_id') or '').strip()
+    if not label:
+        raise K.ContractError('name the lever (a label such as "IL-34")')
+    stage = str(spec.get('stage') or 'all').strip()
+    stage_ids = {s['stage_id'] for s in doc['stages']}
+    if stage != 'all' and stage not in stage_ids:
+        raise K.ContractError(f'stage must be one of {", ".join(sorted(stage_ids))} or "all"; '
+                              f'got {stage!r}')
+    try:
+        lo, hi = float(spec.get('minimum')), float(spec.get('maximum'))
+    except (TypeError, ValueError):
+        raise K.ContractError('give the range a hypothesis may propose within: a minimum and '
+                              'a maximum, as numbers') from None
+    if not lo < hi:
+        raise K.ContractError('the minimum must be below the maximum')
+
+    canonical = None
+    for name in (raw_id, label):
+        found = PR.resolve(name, required=False) if name else None
+        if found and not PR.is_local(found):
+            canonical = found
+            break
+    if canonical:
+        pid, how = canonical, 'canonical'
+        c = PR.BY_ID[pid]
+        if c.global_min is not None and lo < c.global_min or (
+                c.global_max is not None and hi > c.global_max):
+            raise K.ContractError(f'{c.label} is a canonical parameter allowed '
+                                  f'[{c.global_min}, {c.global_max}] {c.unit}; the range must '
+                                  f'sit inside it')
+    else:
+        how = 'local'
+        pid = raw_id if PR.ID_RE.match(raw_id or '') else _slug_id(label, unit)
+        if not PR.ID_RE.match(pid or ''):
+            raise K.ContractError(f'could not make a parameter id from {label!r}; give one '
+                                  f'(lower-case letters, digits, underscores)')
+        if not unit:
+            raise K.ContractError(f'{label} is not a canonical parameter, so it needs a unit')
+        aliases = [a for a in {raw_id} if a and a != pid and a.lower() != label.lower()]
+        if not any(d['parameter_id'] == pid for d in doc['local_parameters']):
+            doc['local_parameters'].append({
+                'parameter_id': pid, 'label': label, 'unit': unit,
+                'meaning': (spec.get('meaning') or '').strip()[:400] or None,
+                'aliases': aliases, 'registered_by': registered_by,
+                'registered_at': K.now_iso(), 'from_run': from_run,
+                'from_hypothesis': spec.get('hypothesis_id')})
+    if any(p['parameter_id'] == pid for p in doc['parameters']):
+        raise K.ContractError(f'{doc["project_id"]} already has {pid}')
+    status = (doc.get('simulator') or {}).get('status')
+    origin = (f'registered by {registered_by or "a person"}'
+              + (f' from run {from_run}' if from_run else '')
+              + (f' (hypothesis {spec["hypothesis_id"]})' if spec.get('hypothesis_id') else ''))
+    row = {
+        'parameter_id': pid, 'stage': stage,
+        'simulator_coverage': 'no_simulator' if status == 'none' else 'not_modelled',
+        'display_name': label, 'minimum': lo, 'maximum': hi,
+        'bound_origin': {'source': 'design_choice',
+                         'basis': (spec.get('bound_basis') or '').strip()[:300]
+                                  or f'the range given when the lever was {origin}'},
+        'notes': (f'Candidate lever {origin}. The reactor model has no term for it: it is a '
+                  f'design variable, and any simulated effect is an assumption.')}
+    return pid, how, row
+
+
+# ── terms a run proposes ───────────────────────────────────────────────
+# A project built on the base reactor gets a simulator for its own biology one
+# term at a time. A run may PROPOSE a term for a lever the reactor has no
+# equation for — a shape and constants read from cited claims — and play it,
+# labelled DE NOVO. It goes onto the project only when a person adds it, and
+# even then it stays what it is: proposed by an agent, uncalibrated.
+def _proposed(rm, pid, proposed_by):
+    if not isinstance(rm, dict):
+        raise K.ContractError(f'{pid}: response_model is an object: shape, target, constants, '
+                              f'max_effect, basis and references')
+    if not [r for r in rm.get('references') or [] if str(r).strip()]:
+        raise K.ContractError(
+            f'{pid}: a term an agent proposes rests on cited claims, and this one cites none. '
+            f'Record the lever as a gap instead; a person may still declare a response for it '
+            f'from their own experience.')
+    rm = dict(rm, proposed_by=proposed_by or rm.get('proposed_by') or 'discovery agent')
+    return {'simulator_coverage': 'de_novo_ai',
+            'response_model': _response_model(rm, pid, 'de_novo_ai')}
+
+
+def _apply_term(doc, term, *, proposed_by, from_run=None):
+    """Put one proposed term onto *doc* (a copy); returns the parameter id."""
+    raw = str(term.get('parameter_id') or '').strip()
+    pid = PR.resolve(raw, required=False) or raw if raw else None
+    row = next((p for p in doc['parameters'] if pid and p['parameter_id'] == pid), None)
+    if row is None:
+        pid, _, row = _add_row(doc, term, registered_by=proposed_by, from_run=from_run)
+        doc['parameters'].append(row)
+    elif row.get('simulator_coverage') == 'modelled':
+        raise K.ContractError(f'{pid} already has a calibrated term in the reactor; a proposed '
+                              f'one beside it would be a second, unfitted definition')
+    row.update(_proposed(term.get('response_model'), pid, proposed_by))
+    row.pop('simulator_mapping', None)
+    return pid
+
+
+def with_proposed_terms(project, terms, *, run_id=None):
+    """The project with a run's proposed terms applied — in memory, never saved.
+
+    Returns (project, parameter ids). Each term is validated exactly as a term
+    on a saved project would be, so a term that could not be adopted cannot be
+    simulated either.
+    """
+    doc = _editable(project.doc)
+    by = f'discovery run {run_id}' if run_id else 'discovery agent'
+    pids = [_apply_term(doc, t, proposed_by=by, from_run=run_id) for t in terms or []]
+    return PJ.Project(doc), pids
+
+
+def adopt_term(identity, project_id, term, *, accepted_by, from_run=None):
+    """Add a term a run proposed to the caller's own project.
+
+    Accepting is not declaring: the term keeps its origin (an agent proposed it
+    from cited claims) and stays uncalibrated; the person who added it is
+    recorded beside who proposed it.
+    """
+    project = load_for(identity, project_id)
+    doc = _editable(project.doc)
+    by = f'discovery run {from_run}' if from_run else 'discovery agent'
+    pid = _apply_term(doc, term, proposed_by=by, from_run=from_run)
+    row = next(p for p in doc['parameters'] if p['parameter_id'] == pid)
+    row['response_model'].update(accepted_by=accepted_by, accepted_at=K.now_iso())
+    _bump(doc)
+    PJ.Project(doc)
+    save(identity, doc, overwrite=True)
+    return doc, pid
+
+
+def _bump(doc):
+    major, minor, patch = (list(map(int, str(doc.get('version') or '0.1.0').split('.')[:3]))
+                           + [0, 0, 0])[:3]
+    doc['version'] = f'{major}.{minor}.{patch + 1}'
+
+
+def _declared(rm, pid, by):
+    """A person's statement of how a parameter acts, as the project stores it."""
+    if not isinstance(rm, dict):
+        raise K.ContractError('response_model is an object: shape, target, constants, '
+                              'max_effect and basis')
+    rm = dict(rm, proposed_by=by or rm.get('proposed_by'))
+    return {'simulator_coverage': 'expert_declared',
+            'response_model': _response_model(rm, pid, 'expert_declared')}
+
+
+def model_parameter(identity, project_id, parameter_id, response_model, *, declared_by=None):
+    """Give a parameter of the caller's own project a declared response.
+
+    For a parameter the project's model has no term for. A parameter the
+    calibrated model covers keeps its fitted term: a declared one beside it
+    would be a second, unfitted definition of the same thing.
+    """
+    project = load_for(identity, project_id)
+    doc = dict(project.doc)
+    doc['parameters'] = [dict(p) for p in doc['parameters']]
+    pid = PR.resolve(parameter_id, required=False) or parameter_id
+    row = next((p for p in doc['parameters'] if p['parameter_id'] == pid), None)
+    if row is None:
+        raise K.ContractError(f'{project.project_id} has no parameter {pid}; register it first')
+    if row.get('simulator_coverage') == 'modelled':
+        raise K.ContractError(f'{pid} is covered by the calibrated model; its effect is the '
+                              f'model\'s, not a declared one')
+    row.update(_declared(response_model, pid, declared_by))
+    row.pop('simulator_mapping', None)
+    _bump(doc)
+    PJ.Project(doc)
+    save(identity, doc, overwrite=True)
+    return doc, pid

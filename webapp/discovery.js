@@ -1,0 +1,4425 @@
+'use strict';
+/* The discovery workflow: pick a project, state an objective, choose a runtime,
+   watch it work, read what it found.
+ *
+ * Two rules this file exists to hold, and they are the reason it is long.
+ *
+ * 1. Nothing is rendered from prose. Every card is built from a structured
+ *    payload the backend validated against a contract. If a field is absent the
+ *    card says so; it never fills a gap with a plausible sentence.
+ * 2. Every badge can explain itself. The glossary is fetched once and attached
+ *    to each badge as a popover, because a reader who does not know whether a
+ *    number is MEASURED or SIMULATED is reading decoration, and nobody goes to
+ *    a repository to find out.
+ */
+
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const el = (t, c, x) => { const n = document.createElement(t); if (c) n.className = c;
+  if (x != null) n.textContent = x; return n; };
+const num = (v, nd = 3) => (typeof v === 'number' && isFinite(v))
+  ? (Math.abs(v) >= 1e6 ? v.toExponential(2) : (+v.toFixed(nd)).toString()) : '—';
+
+/* The one thing this page keeps in the browser: which run you were watching.
+   A real AI run outlives a page load, and losing the only reference to one you
+   are paying for because you reloaded a tab is not acceptable. The id is enough
+   — the run journals itself beside its artifacts on the server. */
+const LAST_RUN_KEY = 'bs-last-discovery-run';
+function rememberRun(id) {
+  try { localStorage.setItem(LAST_RUN_KEY, id); } catch (_) { /* private mode */ }
+}
+function forgetRun() {
+  try { localStorage.removeItem(LAST_RUN_KEY); } catch (_) { /* private mode */ }
+}
+function rememberedRun() {
+  try { return localStorage.getItem(LAST_RUN_KEY); } catch (_) { return null; }
+}
+
+const state = {
+  glossary: null, runtime: null, projects: [], project: null, datasets: [],
+  run: null, es: null, detach: null, result: null, benchmark: null,
+  candidates: {}, projectParams: [],
+};
+
+/* ── glossary popover ───────────────────────────────────────────────────
+   One element, moved and refilled, rather than one per badge: a page with
+   forty hypotheses would otherwise carry forty hidden panels. */
+let glossEl = null;
+function glossNode() {
+  if (!glossEl) { glossEl = el('div', 'gloss'); glossEl.setAttribute('role', 'tooltip');
+    document.body.append(glossEl); }
+  return glossEl;
+}
+function showGloss(target, group, term) {
+  const d = state.glossary && state.glossary.groups[group] &&
+    state.glossary.groups[group].terms[term];
+  if (!d) return;
+  const g = glossNode();
+  g.textContent = '';
+  g.append(Object.assign(el('h5', null, state.glossary.groups[group].title), {}),
+    el('p', 's', d.short || d.label || term));
+  if (d.long) g.append(el('p', 'l', d.long));
+  g.classList.add('on');
+  const r = target.getBoundingClientRect(), gr = g.getBoundingClientRect();
+  let left = r.left, top = r.bottom + 8;
+  if (left + gr.width > innerWidth - 12) left = Math.max(12, innerWidth - gr.width - 12);
+  if (top + gr.height > innerHeight - 12) top = Math.max(12, r.top - gr.height - 8);
+  g.style.left = left + 'px'; g.style.top = top + 'px';
+}
+function hideGloss() { if (glossEl) glossEl.classList.remove('on'); }
+
+/* A badge that knows what it means. Falls back to a plain span when the
+   glossary has no entry, rather than offering an explanation that is not there. */
+function term(group, key, text, cls) {
+  const label = (state.glossary && state.glossary.groups[group] &&
+    state.glossary.groups[group].terms[key] &&
+    state.glossary.groups[group].terms[key].label) || key;
+  const known = !!(state.glossary && state.glossary.groups[group] &&
+    state.glossary.groups[group].terms[key]);
+  if (!known) return el('span', cls || '', text || label);
+  const b = el('button', (cls || 'term-plain') + ' term', text || label);
+  b.type = 'button';
+  b.setAttribute('aria-label', `${text || label}: what this means`);
+  const show = () => showGloss(b, group, key);
+  b.addEventListener('mouseenter', show);
+  b.addEventListener('focus', show);
+  b.addEventListener('click', e => { e.preventDefault(); show(); });
+  b.addEventListener('mouseleave', hideGloss);
+  b.addEventListener('blur', hideGloss);
+  return b;
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hideGloss(); });
+addEventListener('scroll', hideGloss, { passive: true });
+
+/* ── boot ───────────────────────────────────────────────────────────────── */
+async function get(path) {
+  const r = await fetch(path);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(d.error || `${path} answered ${r.status}`), d);
+  return d;
+}
+async function post(path, body) {
+  const r = await fetch(path, { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(d.error || `${path} answered ${r.status}`), d);
+  return d;
+}
+
+async function boot() {
+  try { state.glossary = await get('/api/glossary'); } catch (_) { /* badges degrade */ }
+  await Promise.all([loadRuntime(), loadProjects(), loadDatasets(), loadBenchmarks()]);
+  wire();
+  renderStages(null);
+  mountRunBeacon();
+  /* The selector's active-run counts come from the same list the Runs page
+     reads, so "1 active investigation" means the same thing on both. */
+  BS.onChange(s => {
+    renderProjectRunList(s);
+    /* Not while somebody is using it: rebuilding a select that has focus closes
+       the list under their cursor. */
+    if (document.activeElement === $('#project')) return;
+    loadProjects().catch(() => {});
+  });
+  await resume();
+}
+
+/* ── picking a run back up ───────────────────────────────────────────────
+   Three outcomes, and the difference between them is the point: a run still
+   going is re-attached to its live stream; a finished one is rendered from the
+   record it wrote; one the server has no record of is forgotten rather than
+   reported as anything. */
+async function resume() {
+  const id = (new URLSearchParams(location.search)).get('run') || rememberedRun();
+  if (!id) return;
+  /* Re-attach to the run that is already going. Never start another: the browser
+     observes a server-side job, and a reload is a new observer, not a new run. */
+  watchRun(id);
+}
+
+function note(text) {
+  const box = $('#runState');
+  if (!box) return;
+  if (!text) { box.hidden = true; return; }
+  box.hidden = false; box.textContent = '';
+  const w = el('div', 'state info'); w.append(el('p', 'dim', text)); box.append(w);
+}
+
+async function loadRuntime() {
+  try { state.runtime = await get('/api/runtime?probe=1'); }
+  catch (_) { return; }
+  renderRuntimePicker();
+  renderIdentity();
+}
+
+/* The account area. Three things belong here and nothing else: who you are,
+   what this deployment lets you do, and the way in or out. The role comes from
+   the server on every load — the page cannot award itself one, and setting
+   is_admin in a console does nothing but lie to the person who typed it. */
+function renderIdentity() {
+  const box = $('#identity'); if (!box) return;
+  const id = state.runtime && state.runtime.identity;
+  box.textContent = '';
+  if (!id) return;
+  if (id.is_admin) box.append(el('span', 'rt-badge admin', 'ADMIN'));
+  if (id.authenticated) {
+    box.append(el('span', 'mono dim', id.display_name || id.display), ' ');
+    const out = el('button', 'btn', 'Sign out');
+    out.addEventListener('click', async () => {
+      await post('/api/auth/logout'); location.reload();
+    });
+    box.append(out);
+  } else if (id.sign_in_available) {
+    const inBtn = el('button', 'btn', 'Sign in');
+    inBtn.addEventListener('click', () => $('#signinCard').hidden = !$('#signinCard').hidden);
+    box.append(inBtn);
+  }
+  const note = $('#identityNote');
+  if (note) note.textContent = id.note || '';
+  renderAllowance(id);
+}
+
+/* What is left, and only where the server actually knows. A page that invents a
+   remaining-run count is worse than one that shows none. */
+function renderAllowance(id) {
+  const host = $('#allowance'); if (!host) return;
+  host.textContent = '';
+  const a = (id && id.allowance) || null;
+  if (!a) { host.hidden = true; return; }
+  host.hidden = false;
+  if (a.role === 'admin') {
+    host.append(el('span', 'rt-badge admin', 'ADMIN ACCESS'),
+      el('span', 'dim', 'Public demo limits do not apply. Runs still spend this '
+        + 'deployment\u2019s model credits.'));
+    return;
+  }
+  if (!a.capped) { host.hidden = true; return; }
+  const bits = [];
+  if (a.real_runs_remaining_today != null) {
+    bits.push(`${a.real_runs_remaining_today} Real AI run`
+      + (a.real_runs_remaining_today === 1 ? '' : 's') + ' remaining today');
+  }
+  if (a.next_run_in_s) bits.push(`next run available in ${a.next_run_in_s}s`);
+  if (a.deployment_runs_remaining_today != null) {
+    bits.push(`${a.deployment_runs_remaining_today} left across this service today`);
+  }
+  host.append(el('span', 'rt-badge demo-limits', 'BIOSENSE DEMO AI'),
+    el('span', 'dim', bits.join(' \u00b7 ')));
+}
+
+function renderRuntimePicker() {
+  const host = $('#runtimes'); if (!host || !state.runtime) return;
+  host.textContent = '';
+  const avail = state.runtime.availability || {};
+  /* The real runtime first where this deployment offers one. On the hosted
+     service that is the product: pressing the button runs the actual agents, and
+     the demonstration path is the deliberate second choice, not the default a
+     visitor lands on by accident. */
+  const def = state.runtime.default_mode;
+  const order = state.runtime.modes.slice().sort((a, b) => {
+    const rank = m => (m.mode === def && m.offered ? 0 : m.offered ? 1 : 2);
+    return rank(a) - rank(b);
+  });
+  order.forEach(m => {
+    const a = avail[m.mode] || {};
+    const usable = m.offered && (a.ok !== false);
+    const lab = el('label', 'rt-opt' + (usable ? '' : ' off'));
+    const input = el('input');
+    input.type = 'radio'; input.name = 'runtime'; input.value = m.mode;
+    input.disabled = !usable;
+    if (m.mode === state.runtime.default_mode && usable) input.checked = true;
+    lab.append(input, el('div', 't', m.label), el('div', 'b', m.blurb));
+    if (!usable) {
+      const why = el('div', 'why', a.headline || 'Not offered by this deployment.');
+      if (a.next_step) { why.append(document.createElement('br'));
+        why.append(el('code', null, a.next_step)); }
+      // The sandbox's own words (e.g. "this host does not let bwrap create a user
+      // namespace") are what an operator needs to fix it, and carry no secret.
+      if (a.reason === 'agent_sandbox_unavailable' && a.detail) {
+        why.append(el('div', 'dim mono', a.detail));
+      }
+      lab.append(why);
+    }
+    // Said, not hidden: a demo deployment that runs the agents without their OS
+    // sandbox labels the real-AI choice with it.
+    const sb = state.runtime.agent_sandbox;
+    if (sb && sb.sandbox === 'off' && m.mode === 'local_real_ai' && sb.note) {
+      lab.append(el('div', 'why', sb.note));
+    }
+    lab.addEventListener('change', updateBadge);
+    host.append(lab);
+  });
+  if (!host.querySelector('input:checked')) {
+    const first = host.querySelector('input:not(:disabled)');
+    if (first) first.checked = true;
+  }
+  renderLimits();
+  updateBadge();
+}
+
+/* What a visitor is allowed to spend, before they are refused rather than
+   after. A cap nobody could read first reads like a fault. */
+function renderLimits() {
+  const lim = state.runtime && state.runtime.limits;
+  const host = $('#limits');
+  if (!host) return;
+  host.textContent = '';
+  if (!lim || !lim.public_demo) { host.hidden = true; return; }
+  host.hidden = false;
+  host.append(el('span', 'rt-badge demo-limits', 'DEMO LIMITS'));
+  const bits = [];
+  if (lim.max_real_runs_per_client_per_day)
+    bits.push(`${lim.max_real_runs_per_client_per_day} real AI runs per visitor per day`);
+  if (lim.max_real_runs_per_day)
+    bits.push(`${lim.max_real_runs_per_day} across the service per day`);
+  if (lim.real_run_timeout_s)
+    bits.push(`each run stops after ${Math.round(lim.real_run_timeout_s / 60)} minutes `
+      + '(the live panel offers more time before it does)');
+  if (lim.real_run_cooldown_s)
+    bits.push(`${lim.real_run_cooldown_s}s between runs`);
+  host.append(el('span', 'dim', bits.join(' · ')));
+  host.append(el('div', 'note', 'This service runs real AI on its own model credentials, so '
+    + 'real runs are capped. The demonstration path has no cap, and running BioSense '
+    + 'yourself has none either: ./scripts/start_local_ai.sh'));
+}
+
+/* The badge this deployment uses for a mode. A hosted service runs its own
+   runtime on its own loopback, which is `local_real_ai` in the code and ONLINE
+   to the person reading it: "LOCAL" in a browser means "your laptop". */
+function modeLabel(mode) {
+  const m = ((state.runtime && state.runtime.modes) || []).find(x => x.mode === mode);
+  return (m && m.label) || mode;
+}
+
+function chosenRuntime() {
+  const r = $('#runtimes input:checked');
+  return r ? r.value : (state.runtime && state.runtime.default_mode) || 'synthetic_demo';
+}
+
+function updateBadge() {
+  const mode = chosenRuntime();
+  const host = $('#runtimeBadge'); if (!host) return;
+  const id = state.runtime && state.runtime.identity;
+  host.textContent = '';
+  host.className = 'rt-badge ' + mode;
+  host.append(el('span', 'dot'));
+  /* "ADMIN · REAL AI — ONLINE". The role says who is running it; the runtime
+     says what kind of answer it is. Neither word changes the other's meaning:
+     an operator's synthetic run is still synthetic. */
+  if (id && id.is_admin) host.append(el('span', 'role', 'ADMIN \u00b7 '));
+  host.append(term('runtime_mode', mode, modeLabel(mode)));
+}
+
+async function loadProjects(select) {
+  let d;
+  try { d = await get('/api/workspace/projects'); } catch (_) { return; }
+  /* Your own projects first, then templates; a project with a model ahead of one
+     without. The default matters: landing on an unrelated project produces a run
+     that refuses everything for the right reason and reads like a fault. */
+  state.projects = d.projects.slice().sort((a, b) =>
+    (a.source === 'workspace' ? 0 : 1) - (b.source === 'workspace' ? 0 : 1)
+    || (b.has_simulator ? 1 : 0) - (a.has_simulator ? 1 : 0)
+    || a.name.localeCompare(b.name));
+  const sel = $('#project');
+  const want = select || sel.value || BS.selected.get();
+  sel.textContent = '';
+  state.projects.forEach(p => {
+    const runs = p.runs || {};
+    const o = el('option', null, p.name
+      + (p.source === 'template' ? '  (template)' : '')
+      + (runs.active ? `   ● ${runs.active} active` : ''));
+    o.value = p.project_id; sel.append(o);
+  });
+  if (want && state.projects.some(p => p.project_id === want)) sel.value = want;
+  if (!sel.dataset.wired) {
+    sel.dataset.wired = '1';
+    /* Switching project changes what you are looking at and nothing else. No
+       run is touched: they are server-side jobs, and the one you were watching
+       keeps working while you read another project. */
+    sel.addEventListener('change', () => { BS.selected.set(sel.value); showProject(); });
+  }
+  showProject();
+}
+
+async function showProject() {
+  const id = $('#project').value;
+  const row = state.projects.find(p => p.project_id === id);
+  const note = $('#projectNote');
+  if (!row) { note.textContent = ''; return; }
+  BS.selected.set(id);
+  renderProjectRunList(BS.state);
+  note.textContent = row.has_simulator
+    ? 'This project has a mechanistic model, so candidate parameters it covers get a prediction.'
+    : 'This project has no mechanistic model. Parameters are real design variables; nothing '
+      + 'here predicts what they would do, and no other project’s model is borrowed.';
+  const runs = row.runs || {};
+  const r = $('#projectRuns');
+  if (r) {
+    r.textContent = runs.active
+      ? `● ${runs.active} active investigation${runs.active === 1 ? '' : 's'}`
+        + (runs.total > runs.active ? ` · ${runs.total} total` : '')
+      : (runs.total ? `${runs.total} run${runs.total === 1 ? '' : 's'}` : 'No runs yet');
+  }
+  if (!$('#projectDetail').hidden) renderProjectDetail(id);
+
+  state.candidates = {};
+  renderCandidatePicks();
+  loadProjectParameters(id);
+}
+
+function currentProject() { const s = $('#project'); return s ? s.value : null; }
+
+/* Deleting moves the run to the server's trash: no longer listed or served,
+   recoverable from the Trash on the Runs page. Asked once, by name. */
+/* A name a person can change at any time. It is a label on the run, never a
+   change to what the agents were asked. */
+async function renameRun(r) {
+  const now = r.title || '';
+  const next = prompt('Name this run — what you will call it in the list:', now);
+  if (next === null) return;
+  try {
+    await post(`/api/discovery/${encodeURIComponent(r.run_id)}/rename`,
+               { title: next.trim() });
+    await BS.runs(currentProject());
+  } catch (e) { fail(e); }
+}
+
+async function deleteRun(r) {
+  const what = (r.objective || r.run_id).slice(0, 120);
+  if (!confirm(`Delete this run?\n\n"${what}"\n\nIt moves to the Trash (Runs page), `
+    + 'where you can restore it or remove it for good.')) return;
+  try {
+    await post(`/api/discovery/${r.run_id}/delete`);
+    if (state.run && state.run.run_id === r.run_id) forgetRun();
+    await BS.runs(currentProject());
+  } catch (e) { fail(e); }
+}
+
+async function deleteProject(id, name, runCount) {
+  const msg = `Delete the project "${name || id}"?`
+    + (runCount ? `\n\nIts ${runCount} run${runCount === 1 ? '' : 's'} will be deleted with it.` : '')
+    + '\n\nIt moves to the Trash (Runs page), where you can restore it or remove it for good.';
+  if (!confirm(msg)) return;
+  try {
+    await post(`/api/projects/${encodeURIComponent(id)}/delete`, { delete_runs: true });
+    $('#projectDetail').hidden = true;
+    BS.selected.set(null);
+    await loadProjects();
+    await BS.runs(currentProject());
+  } catch (e) { fail(e); }
+}
+
+/* The project's runs, right under the picker: a scientist comes back to a
+   project to see what it already found, so that is one click, not three. Fed
+   by the same listing as the Runs page, scoped to the account. */
+const RUN_LIST_MAX = 8;
+/* The runs poll every few seconds. Rebuilding the list on every poll threw
+   away whatever the person was doing in it: the Compare pickers snapped back
+   to their defaults and a comparison that came back landed in a box that had
+   already been replaced, so pressing Compare looked like nothing happened.
+   So the list is rebuilt only when what it shows changed, and the comparison
+   lives outside the rebuild. */
+let runListSig = null;
+function renderProjectRunList(snapshot) {
+  const host = $('#projectRunList'); if (!host) return;
+  const id = currentProject();
+  const runs = ((snapshot && snapshot.runs) || []).filter(r => !id || r.project_id === id);
+  const sig = JSON.stringify([id, runs.map(r => [r.run_id, r.live, r.group, BS.fmt.status(r),
+    r.title, r.objective, r.hypothesis, r.hypothesis_count, r.started_at])]);
+  if (sig === runListSig && host.firstChild) return;
+  runListSig = sig;
+  host.textContent = '';
+  if (!runs.length) return;
+  /* Folded by default once there are more than a couple: the list is for
+     finding a run, not for filling the page. */
+  const box = el('details', 'prun-list');
+  box.dataset.key = 'prunlist';
+  box.open = rememberedOpen('prunlist', runs.length <= 3);
+  box.addEventListener('toggle', () => rememberOpen('prunlist', box.open));
+  box.append(el('summary', null, `Runs in this project (${runs.length})`));
+  host.append(box);
+  compareBar(box, runs.filter(r => !r.live));
+  runs.slice(0, RUN_LIST_MAX).forEach(r => {
+    const row = el('div', 'prun');
+    const when = r.started_at ? new Date(r.started_at * 1000).toLocaleString([], {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+    row.append(el('span', 'dim mono', when));
+    row.append(el('span', 'rv-status ' + (r.live ? 'go' : r.group || ''), BS.fmt.status(r)));
+    /* The name the person gave it, else what they asked. Never the hypothesis
+       the run produced: six runs on one objective then read as six different
+       things, none of them what was typed. */
+    const named = !!r.title;
+    const what = el('span', 'pobj' + (named ? ' named' : ''),
+      r.title || r.objective || r.run_id);
+    what.title = [r.objective, r.hypothesis && 'Found: ' + r.hypothesis]
+      .filter(Boolean).join('\n\n');
+    row.append(what);
+    row.append(el('span', 'dim', r.hypothesis_count > 1 ? `+${r.hypothesis_count - 1}` : ''));
+    const ren = el('button', 'btn del', '✎');
+    ren.title = named ? 'Rename this run' : 'Give this run a name';
+    ren.setAttribute('aria-label', ren.title);
+    ren.addEventListener('click', () => renameRun(r));
+    row.append(ren);
+    const open = el('button', 'btn', r.live ? 'Watch' : 'Open');
+    open.addEventListener('click', () => watchRun(r.run_id));
+    row.append(open);
+    /* A finished run can be removed; a live one must be stopped first. */
+    if (!r.live) {
+      const del = el('button', 'btn del', '✕');
+      del.title = 'Delete this run'; del.setAttribute('aria-label', 'Delete this run');
+      del.addEventListener('click', () => deleteRun(r));
+      row.append(del);
+    }
+    box.append(row);
+  });
+  if (runs.length > RUN_LIST_MAX) {
+    const a = el('a', 'dim', `All ${runs.length} runs of this project →`);
+    a.href = `runs.html?project=${encodeURIComponent(id)}`;
+    box.append(a);
+  }
+}
+
+/* The same protocol in another vessel.
+ *
+ * Nobody starts in a bioreactor. The plate is where a factor is tried, the
+ * tube is where aggregates first form, the tank is where the cell numbers
+ * come from — and a protocol written for one of them is most of a protocol
+ * for the others. What this shows is exactly how much of it: the
+ * concentrations carry and get an amount per vessel, the mixing and the
+ * oxygen do not carry at all, and what the new vessel needs decided is listed
+ * rather than filled in.
+ */
+const FORMAT_KIND = {
+  carried: ['ok', 'carries'],
+  amount: ['ok', 'carries'],
+  set_here: ['warn', 'set for this vessel'],
+  dropped: ['bad', 'not in this vessel'],
+  unknown: ['mut', 'check it'],
+};
+
+function formatPanel(p, snap) {
+  const wrap = el('div', 'fmtbox');
+  const bar = el('div', 'cmpbar');
+  bar.append(el('span', 'dim', 'Lay this protocol out in'));
+  const sel = el('select', 'cmpsel');
+  sel.setAttribute('aria-label', 'Culture format');
+  [['six_well', '6-well plate'], ['cero', 'CERO 3D rotating tube'],
+    ['stirred_tank', 'Stirred-tank bioreactor']].forEach(([v, t]) => {
+    if (v === p.culture_format) return;       // it is already in that one
+    const o = el('option', null, t); o.value = v; sel.append(o);
+  });
+  const vol = el('input', 'cmpsel');
+  vol.type = 'number'; vol.min = '0.1'; vol.step = '0.1';
+  vol.placeholder = 'working volume (mL)';
+  vol.setAttribute('aria-label', 'Working volume in mL');
+  const go = el('button', 'btn', 'Lay it out');
+  const out = el('div', 'cmpout');
+  const run = async () => {
+    go.disabled = true; out.textContent = '';
+    out.append(el('p', 'dim', 'Working it out…'));
+    try {
+      const q = `to=${encodeURIComponent(sel.value)}`
+        + (vol.value ? `&working_volume_ml=${encodeURIComponent(vol.value)}` : '');
+      const d = await get(`/api/discovery/${snap.run_id}/translate?${q}`);
+      out.textContent = '';
+      renderTranslation(out, d, snap);
+    } catch (e) {
+      out.textContent = '';
+      out.append(el('p', 'dim', e.message || 'That could not be laid out.'));
+    } finally { go.disabled = false; }
+  };
+  go.addEventListener('click', run);
+  sel.addEventListener('change', () => { out.textContent = ''; });
+  bar.append(sel, vol, go);
+  wrap.append(bar, out);
+  return wrap;
+}
+
+function renderTranslation(host, t, snap) {
+  const to = t.to;
+  const head = el('div', 'cmphead');
+  head.append(el('div', 'route-lab', to.label));
+  head.append(el('div', null, t.headline));
+  const facts = el('div', 'dim fmtfacts');
+  [['Vessel', to.vessel],
+    ['Working volume', t.working_volume_ml
+      ? `${num(t.working_volume_ml)} mL — ${t.working_volume_basis}`
+      : 'not set: give one above to get the amount per vessel'],
+    ['Mixing', to.mixing], ['Oxygen', to.gas_exchange], ['Feeding', to.feeding]]
+    .forEach(([k, v]) => facts.append(kv(k, v)));
+  head.append(facts);
+  host.append(head);
+
+  (t.stages || []).forEach(st => {
+    if (!(st.items || []).length) return;
+    host.append(el('div', 'plan-lab', st.label || st.stage_id));
+    st.items.forEach(r => host.append(translationRow(r)));
+  });
+  if ((t.physical || []).length) {
+    host.append(el('div', 'plan-lab', 'Vessel settings'));
+    t.physical.forEach(r => host.append(translationRow(r)));
+  }
+  if (t.per_unit) {
+    host.append(el('p', 'dim', `Amounts are per ${to.vessel}. One `
+      + `${t.per_unit.label} is ${t.per_unit.vessels}× that.`));
+  }
+  host.append(el('div', 'plan-lab', 'What this vessel needs you to decide'));
+  const ul = el('ul', 'tight');
+  (t.decide || []).forEach(d => {
+    const li = el('li');
+    li.append(el('b', null, d.what));
+    li.append(document.createTextNode(' — ' + d.why
+      + (d.typical ? ` (typical: ${d.typical})` : '')));
+    ul.append(li);
+  });
+  host.append(ul);
+  host.append(el('p', 'caveat', t.simulator_note));
+  host.append(el('p', 'caveat', t.note));
+  const vq = t.working_volume_ml ? `&working_volume_ml=${t.working_volume_ml}` : '';
+  const word = exportLink(snap.run_id, 'docx', `Bench protocol for the ${to.label} (Word)`,
+    `&as=${encodeURIComponent(to.format_id)}${vq}`);
+  const pdf = exportLink(snap.run_id, 'pdf', `Bench protocol for the ${to.label} (PDF)`,
+    `&as=${encodeURIComponent(to.format_id)}${vq}`);
+  const dl = el('a', 'btn', 'This layout as text');
+  dl.href = `/api/discovery/${snap.run_id}/translate?to=${encodeURIComponent(to.format_id)}`
+    + `${vq}&format=md`;
+  dl.target = '_blank'; dl.rel = 'noopener';
+  host.append(word, pdf, dl);
+}
+
+function translationRow(r) {
+  const [cls, word] = FORMAT_KIND[r.kind] || ['mut', r.kind];
+  const row = el('div', 'fmtrow');
+  const top = el('div');
+  top.append(el('b', null, r.label || r.parameter_id));
+  if (r.value != null) {
+    top.append(el('span', 'v', ` ${num(r.value)}${r.unit ? ' ' + r.unit : ''}`));
+  }
+  if (r.amount) {
+    top.append(el('span', 'tag ok amount',
+      ` ${num(r.amount.amount)} ${r.amount.unit} per vessel`));
+  }
+  top.append(el('span', 'tag ' + cls, ' ' + word));
+  row.append(top);
+  row.append(el('div', 'dim', r.why));
+  return row;
+}
+
+/* Two runs of the same question, side by side.
+ *
+ * A run of this system is a language model reading papers: ask it the same
+ * thing twice and the two answers are not the same file. Until a person can
+ * see how much moved, they have one answer and no idea whether it is the
+ * answer or one of several. The comparison is computed on the server from
+ * what each run wrote; nothing here decides anything, and neither run is ever
+ * called the better one.
+ */
+const AGREE_CLS = { agreed: 'ok', same_direction: 'warn', opposed: 'bad',
+  only_a: 'mut', only_b: 'mut', differs: 'warn' };
+const AGREE_WORD = { agreed: 'agreed', same_direction: 'same way, different dose',
+  opposed: 'opposite ways', only_a: 'run A only', only_b: 'run B only', differs: 'differs' };
+
+/* What the person picked and what came back, kept outside the run list so a
+   rebuild of the list redraws it rather than losing it. */
+const cmpState = { a: null, b: null, busy: false, result: null, error: null, out: null, go: null };
+
+function drawComparison() {
+  const out = cmpState.out; if (!out) return;
+  out.textContent = '';
+  if (cmpState.busy) out.append(el('p', 'dim', 'Comparing…'));
+  else if (cmpState.error) out.append(el('p', 'dim', cmpState.error));
+  else if (cmpState.result) renderComparison(out, cmpState.result);
+  if (cmpState.go) cmpState.go.disabled = cmpState.busy;
+}
+
+function compareBar(host, runs) {
+  if (runs.length < 2) return;
+  const ids = runs.map(r => r.run_id);
+  const bar = el('div', 'cmpbar');
+  bar.append(el('span', 'dim', 'Compare two runs'));
+  const pick = (n, want, fallback) => {
+    const sel = el('select', 'cmpsel');
+    sel.setAttribute('aria-label', `Run ${n}`);
+    runs.forEach(r => {
+      const o = el('option', null, (r.title || r.objective || r.run_id).slice(0, 60));
+      o.value = r.run_id;
+      sel.append(o);
+    });
+    sel.value = ids.includes(want) ? want : ids[fallback];
+    return sel;
+  };
+  const a = pick('A', cmpState.a, 0), b = pick('B', cmpState.b, 1);
+  cmpState.a = a.value; cmpState.b = b.value;
+  const forget = () => { cmpState.result = null; cmpState.error = null; drawComparison(); };
+  a.addEventListener('change', () => { cmpState.a = a.value; forget(); });
+  b.addEventListener('change', () => { cmpState.b = b.value; forget(); });
+  const go = el('button', 'btn', 'Compare');
+  go.type = 'button';
+  const out = el('div', 'cmpout');
+  cmpState.out = out; cmpState.go = go;
+  go.addEventListener('click', async () => {
+    cmpState.result = null; cmpState.error = null;
+    if (cmpState.a === cmpState.b) {
+      cmpState.error = 'Pick two different runs.'; drawComparison(); return;
+    }
+    cmpState.busy = true; drawComparison();
+    const pair = [cmpState.a, cmpState.b];
+    try {
+      const d = await get(`/api/discovery/compare?a=${encodeURIComponent(pair[0])}`
+        + `&b=${encodeURIComponent(pair[1])}`);
+      // Only if the pickers still show the pair that was asked about.
+      if (cmpState.a === pair[0] && cmpState.b === pair[1]) cmpState.result = d;
+    } catch (e) {
+      cmpState.error = e.message || 'Those two runs could not be compared.';
+    } finally {
+      cmpState.busy = false;
+      drawComparison();
+    }
+  });
+  bar.append(a, el('span', 'dim', 'and'), b, go);
+  host.append(bar, out);
+  drawComparison();
+}
+
+function renderComparison(host, c) {
+  const s = c.summary || {};
+  const head = el('div', 'cmphead ' + (c.verdict || ''));
+  head.append(el('div', 'route-lab', (c.verdict || '').replace(/_/g, ' ')));
+  head.append(el('div', null, c.verdict_text));
+  head.append(el('div', 'dim', `A: ${c.a.title || c.a.run_dir} · B: ${c.b.title || c.b.run_dir}`));
+  host.append(head);
+
+  /* The inputs first: two runs asked different things did not measure
+     variability, they measured the difference in the questions. */
+  if ((c.input_differences || []).length) {
+    host.append(el('div', 'plan-lab', 'What was different going in'));
+    c.input_differences.forEach(d => {
+      const row = el('div', 'cmpin');
+      row.append(el('b', null, d.field.replace(/_/g, ' ')));
+      row.append(el('span', 'mono dim', ` A: ${fmtVal(d.a)} · B: ${fmtVal(d.b)}`));
+      row.append(el('div', null, d.means));
+      host.append(row);
+    });
+  }
+
+  host.append(el('div', 'plan-lab', 'Levers'));
+  host.append(el('p', 'dim', `${s.levers_agreed} of ${s.levers_total} agreed`
+    + (s.levers_opposed ? ` · ${s.levers_opposed} pushed opposite ways` : '')
+    + (s.levers_only_one ? ` · ${s.levers_only_one} raised by one run only` : '')));
+  if ((c.levers || []).length) {
+    host.append(foldTable(['Lever', 'Run A', 'Run B', ''], c.levers.map(l => {
+      const a = l.a || {}, b = l.b || {};
+      const tag = el('span', 'tag ' + (AGREE_CLS[l.agreement] || 'mut'),
+        AGREE_WORD[l.agreement] || l.agreement);
+      const side = x => x && x.direction
+        ? `${x.direction}${x.value == null ? '' : ' → ' + num(x.value)}` : '—';
+      return { key: 'cmp:' + l.parameter_id, cells: [l.label, side(a), side(b), tag],
+        detail: appendAll(el('div'), [
+          kv('Run A', a.hypothesis_id ? `${a.hypothesis_id} · ${a.confidence || '—'} confidence`
+            : 'did not raise this lever'),
+          kv('Run B', b.hypothesis_id ? `${b.hypothesis_id} · ${b.confidence || '—'} confidence`
+            : 'did not raise this lever'),
+        ]) };
+    }), 'cmp'));
+  }
+
+  const diff = (c.values || []).filter(v => v.agreement !== 'agreed');
+  if (diff.length) {
+    host.append(el('div', 'plan-lab', 'Recommended values that differ'));
+    diff.forEach(v => {
+      const row = el('div', 'cmpval');
+      row.append(el('b', null, v.label || v.parameter_id));
+      row.append(el('span', 'dim', ` ${v.stage_id}`));
+      row.append(el('span', 'mono', ` A ${fmtVal((v.a || {}).value)} · B ${fmtVal((v.b || {}).value)}`
+        + (v.unit ? ' ' + v.unit : '')));
+      host.append(row);
+    });
+  }
+
+  host.append(el('div', 'plan-lab', 'To make a rerun comparable'));
+  const ul = el('ul', 'tight');
+  (c.to_make_them_comparable || []).forEach(t => ul.append(el('li', null, t)));
+  host.append(ul);
+  host.append(el('p', 'caveat', c.note));
+}
+
+function fmtVal(v) {
+  if (v == null || v === '') return '—';
+  if (Array.isArray(v)) return v.length ? v.join(', ') : 'none';
+  if (typeof v === 'number') return num(v);
+  return String(v);
+}
+
+/* The project as a workspace: what the process is, what is running in it, and
+   what it has produced. A panel, deliberately — not a management screen. */
+async function renderProjectDetail(id) {
+  const host = $('#projectDetail');
+  host.hidden = false;
+  host.textContent = '';
+  let d;
+  try { d = await get(`/api/projects/${encodeURIComponent(id)}`); }
+  catch (e) { host.append(el('p', 'dim', e.message || 'That project is not available.')); return; }
+  const p = d.project || {};
+  const box = el('div', 'pdetail');
+  const bio = p.biological_system || {};
+  const facts = [
+    ['Species', bio.species], ['From', bio.starting_cell], ['To', bio.target_cell],
+    ['State', bio.target_subtype], ['Process', bio.culture_format],
+    ['Stages', (p.stages || []).map(s => s.label || s.stage_id).join(' → ')],
+    ['Parameters', String((p.parameters || []).length)],
+    ['Simulator', p.has_simulator ? p.simulator.model_id : 'none — no prediction is produced'],
+  ];
+  const dl = el('div', 'pfacts');
+  facts.forEach(([k, v]) => {
+    if (!v) return;
+    const row = el('div', 'pf');
+    row.append(el('div', 'k', k), el('div', 'v', v));
+    dl.append(row);
+  });
+  box.append(dl);
+  if ((d.active_runs || []).length) {
+    box.append(el('div', 'lab', 'Active investigation'));
+    d.active_runs.forEach(r => {
+      const row = el('div', 'prun');
+      row.append(el('span', 'rv-status go', BS.fmt.status(r)));
+      row.append(el('span', 'dim', [r.engine ? (r.engine.includes('codex') ? 'Codex' : 'Claude')
+        : null, (r.active_agents || [])[0], BS.fmt.elapsed(r.started_at, r.finished_at)]
+        .filter(Boolean).join(' · ')));
+      const open = el('button', 'btn', 'Open run');
+      open.addEventListener('click', () => watchRun(r.run_id));
+      row.append(open);
+      box.append(row);
+    });
+  }
+  if ((d.recent_runs || []).length) {
+    box.append(el('div', 'lab', 'Recent runs'));
+    d.recent_runs.slice(0, 5).forEach(r => {
+      const row = el('div', 'prun');
+      row.append(el('span', 'dim mono', BS.fmt.status(r)));
+      row.append(el('span', null, r.objective || r.run_id));
+      const open = el('button', 'btn', 'Open');
+      open.addEventListener('click', () => watchRun(r.run_id));
+      row.append(open);
+      box.append(row);
+    });
+  }
+  if ((d.hypotheses || []).length) {
+    box.append(el('div', 'lab', 'Hypotheses from this project'));
+    d.hypotheses.slice(0, 5).forEach(h => box.append(el('p', 'phyp', h.statement)));
+  }
+  if ((p.limitations || []).length) {
+    box.append(el('div', 'lab', 'Limitations'));
+    p.limitations.forEach(l => box.append(el('p', 'dim', l)));
+  }
+  /* Only a project you created can be deleted; the built-in templates are part
+     of the app. A project with a run still going cannot be deleted yet. */
+  if (d.owned) {
+    const row = el('div', 'rv-actions');
+    const del = el('button', 'btn stop', 'Delete this project');
+    if ((d.active_runs || []).length) {
+      del.disabled = true; del.title = 'A run is still going in this project; stop it first';
+    }
+    del.addEventListener('click', () => deleteProject(id, p.name, (d.runs || []).length));
+    row.append(del);
+    box.append(row);
+  }
+  host.append(box);
+}
+
+/* The parameters this project actually has. Read per project rather than from
+   one global list, because offering a CAR-T process an M-CSF field because
+   macrophages have one implies the model knows something about it. */
+async function loadProjectParameters(id) {
+  let d;
+  try { d = await get('/api/projects'); } catch (_) { return; }
+  const p = (d.projects || []).find(x => x.project_id === id);
+  state.projectParams = p ? p.parameters : [];
+  const sel = $('#candParam'); if (!sel) return;
+  sel.textContent = '';
+  (state.projectParams || []).forEach(q => {
+    const o = el('option', null,
+      `${q.label}${q.unit ? ' (' + q.unit + ')' : ''}`
+      + (q.simulator_coverage === 'modelled' ? '' : '  \u2014 not modelled'));
+    o.value = q.parameter_id; sel.append(o);
+  });
+}
+
+function renderCandidatePicks() {
+  const host = $('#candList'); if (!host) return;
+  host.textContent = '';
+  Object.entries(state.candidates || {}).forEach(([pid, v]) => {
+    const q = (state.projectParams || []).find(x => x.parameter_id === pid) || {};
+    const chip = el('span', 'pick');
+    chip.append(el('span', null, `${q.label || pid} = ${v}${q.unit ? ' ' + q.unit : ''}`));
+    if (q.simulator_coverage && q.simulator_coverage !== 'modelled') {
+      chip.append(el('span', 'vis', 'not modelled'));
+    }
+    const x = el('button', 'btn', '\u00d7');
+    x.type = 'button';
+    x.addEventListener('click', () => { delete state.candidates[pid]; renderCandidatePicks(); });
+    chip.append(x);
+    host.append(chip);
+  });
+}
+
+async function loadDatasets() {
+  let d;
+  try { d = await get('/api/datasets'); } catch (_) { return; }
+  state.datasets = d.datasets || [];
+  /* Private uploads are never listed by the server; the Data page remembers the
+     ones made from this browser, and they are offered here for the same person. */
+  let mine = [];
+  try { mine = JSON.parse(localStorage.getItem('biosense.uploads') || '[]'); } catch (_) {}
+  const known = new Set(state.datasets.map(m => m.dataset_id));
+  mine.filter(u => !known.has(u.dataset_id)).forEach(u => state.datasets.push(
+    { dataset_id: u.dataset_id, title: u.title || u.dataset_id, visibility: 'private',
+      yours: true }));
+  const host = $('#datasetPicks'); host.textContent = '';
+  if (!state.datasets.length) {
+    host.append(el('p', 'hint', d.note || 'No datasets are registered on this instance.'));
+    return;
+  }
+  state.datasets.forEach(m => {
+    const lab = el('label', 'pick');
+    const i = el('input'); i.type = 'checkbox'; i.value = m.dataset_id;
+    lab.append(i, el('span', null, m.title || m.dataset_id));
+    if (m.visibility === 'private') lab.append(el('span', 'vis', m.yours ? 'private · yours' : 'private'));
+    host.append(lab);
+  });
+  $('#datasetNote').textContent = d.note || '';
+}
+
+async function loadBenchmarks() {
+  let d;
+  try { d = await get('/api/benchmarks'); } catch (_) { return; }
+  const host = $('#benchList'); if (!host) return;
+  host.textContent = '';
+  d.built.forEach(b => {
+    const w = el('div', 'ds');
+    const t = el('div', 't', b.title || b.benchmark_id); w.append(t);
+    w.append(el('div', 'm', `${b.project} · ${b.passed} passed, ${b.failed} failed · ${b.privacy}`));
+    const open = el('button', 'btn', 'Open');
+    open.addEventListener('click', () => openBenchmark(b.benchmark_id));
+    w.append(open);
+    host.append(w);
+  });
+  const runHost = $('#benchRun'); runHost.textContent = '';
+  d.configs.forEach(c => {
+    const w = el('div', 'ds');
+    w.append(el('div', 't', c.title), el('div', 'm', c.objective));
+    const btn = el('button', 'btn go', 'Run this benchmark');
+    btn.addEventListener('click', () => runBenchmark(c.benchmark_id, btn));
+    w.append(btn);
+    host.parentElement.querySelector('#benchRun').append(w);
+  });
+  $('#benchNote').textContent = d.note || '';
+}
+
+async function openBenchmark(id) {
+  try {
+    const b = await get('/api/benchmarks/' + encodeURIComponent(id));
+    renderBenchmark(b);
+  } catch (e) { fail(e); }
+}
+
+async function runBenchmark(id, btn) {
+  btn.disabled = true;
+  try {
+    const run = await post('/api/benchmarks/run',
+      { benchmark_id: id, runtime_mode: chosenRuntime() });
+    startWatching(run);
+  } catch (e) { fail(e); } finally { btn.disabled = false; }
+}
+
+/* ── the request ─────────────────────────────────────────────────────────
+   Built field by field. Deliberately not one text blob: the ResearchContext
+   carries a strictness setting and the fields a mismatch can be in, and
+   flattening it into prose would throw all of that away. */
+function listFrom(id) {
+  return ($(id).value || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function buildRequest() {
+  const ctxFields = {
+    species: listFrom('#ctxSpecies'), cell_types: listFrom('#ctxCellTypes'),
+    states: listFrom('#ctxStates'), tissues: listFrom('#ctxTissues'),
+    disease_context: listFrom('#ctxDisease'),
+  };
+  const anyCtx = Object.values(ctxFields).some(v => v.length);
+  const body = {
+    project_id: $('#project').value,
+    objective: $('#objective').value.trim(),
+    runtime_mode: chosenRuntime(),
+    effort: ($('#effort') && $('#effort').value) || 'standard',
+    title: (($('#runName') && $('#runName').value) || '').trim() || null,
+    literature_mode: ($('#litMode') && $('#litMode').value) || 'single',
+    bioinformatics_mode: ($('#bioMode') && $('#bioMode').value) || 'single',
+    purpose: ($('#purpose') && $('#purpose').value) || 'discovery',
+    culture_format: (($('#cultureFormat') && $('#cultureFormat').value) || '') || null,
+    public_data: !($('#publicData') && $('#publicData').value === 'off'),
+    dataset_ids: $$('#datasetPicks input:checked').map(i => i.value),
+  };
+  if (anyCtx) {
+    body.research_context = Object.assign({
+      schema_version: '2.0', strictness: $('#ctxStrictness').value,
+      context_id: null, created_at: new Date().toISOString(),
+      modalities: [], assays: [], therapy_context: [], exclude: [],
+      publication_from_year: null, publication_to_year: null, time_range: null,
+      notes: null, applied: null,
+    }, ctxFields);
+  }
+  const constraints = ($('#constraints').value || '').trim();
+  if (constraints) body.process_constraints = { notes: constraints, parameter_bounds: [] };
+  if (Object.keys(state.candidates || {}).length) body.candidate_values = state.candidates;
+  return body;
+}
+
+/* ── running ─────────────────────────────────────────────────────────────── */
+function fail(e) {
+  const box = $('#runState');
+  box.hidden = false; box.textContent = '';
+  const w = el('div', 'state');
+  w.append(el('h4', null,
+    e.reason === 'not_configured' ? 'Runtime not offered'
+      : e.reason === 'budget' ? 'Run limit reached'
+      : e.reason === 'cancelled' || e.reason === 'timed_out' ? 'Run stopped'
+      : e.reason === 'interrupted' ? 'Run interrupted'
+      : e.headline ? 'Real AI runtime unavailable' : 'Refused'));
+  w.append(el('p', null, e.headline || e.message
+    || (typeof e === 'string' ? e : 'The run ended without a result to show.')));
+  if (e.next_step) w.append(el('code', null, e.next_step));
+  if (e.retry_after_s) {
+    w.append(el('p', 'dim', `Try again in about ${Math.ceil(e.retry_after_s / 60)} minute(s).`));
+  }
+  if (e.reason) w.append(el('p', 'dim mono', e.reason));
+  box.append(w);
+}
+
+async function start() {
+  const body = buildRequest();
+  if ((body.objective || '').length < 10) {
+    fail({ message: 'Write at least 10 characters describing what you want to find out.' });
+    return;
+  }
+  $('#runBtn').disabled = true;
+  $('#runState').hidden = true;
+  ['resultPanel', 'protocolPanel', 'otherPanel', 'askDataPanel', 'askPanel', 'evidencePanel',
+   'anaSec', 'benchPanel']
+    .forEach(i => { const n = $('#' + i); if (n) n.hidden = true; });
+  try {
+    const run = await post('/api/discovery', body);
+    startWatching(run);
+  } catch (e) {
+    fail(e);
+    $('#runBtn').disabled = false;
+  }
+}
+
+function startWatching(run) {
+  watchRun(run.run_id);
+}
+
+/* One run, one viewer, one source of truth. The Runs page renders this same
+   snapshot with this same component — so the two pages cannot disagree about
+   whether something is working, which they could when each kept its own idea
+   of a run. */
+function watchRun(runId) {
+  if (state.detach) state.detach();
+  rememberRun(runId);
+  $('#progressPanel').hidden = false;
+  $('#runRef').textContent = runId;
+  state.detach = RV.attach(runId, {
+    snapshot(snap) {
+      state.run = snap;
+      RV.header($('#rvHead'), snap, { onStop: stopRun, onExtend: extendRun,
+                                      onPause: pauseRun, onContinue: continueRun,
+                                      onFollowUp: followUpRun });
+      RV.stages($('#rvStages'), snap);
+      RV.agents($('#rvAgents'), snap);
+      RV.timeline($('#rvTimeline'), snap);
+      RV.limitations($('#rvLims'), snap);
+      renderInsights(snap);
+      renderRound(snap);
+      renderQuestions(snap);
+      renderAlternates(snap);
+      renderBreakthrough(snap);
+      renderDataRequests(snap);
+      renderStages(snap.progress);
+      (snap.events || []).forEach(seedEvent);
+      $('#runBtn').disabled = RV.isLive(snap);
+      showStop(snap);
+      focusTheAnswer(snap);
+      if (snap.status === 'done' && snap.result) {
+        state.result = snap.result; renderResult(snap);
+        note(snap.recovered ? 'Reopened from the server: this is the run you were last '
+          + 'watching, read back from its saved record. Nothing went wrong.' : null);
+      } else if (!RV.isLive(snap) && snap.result && hasPartial(snap.result)) {
+        /* Stopped by the time limit, by a person, or by a restart: what the
+           agents had written is still worth reading. Shown, and labelled
+           partial — never as a finished answer. */
+        state.result = snap.result; renderResult(snap);
+        fail({ headline: 'Partial result — ' + (snap.error || 'this run did not finish'),
+          reason: snap.error_reason, next_step: snap.next_step, message: snap.error });
+      } else if (!RV.isLive(snap)) {
+        fail({ headline: snap.error, reason: snap.error_reason, next_step: snap.next_step,
+          message: snap.error });
+      }
+      BS.runs(currentProject()).catch(() => {});
+    },
+    event(e) { pushEvent(e); },
+    error() {
+      $('#runBtn').disabled = false;
+      showStop(null);
+      forgetRun();
+      $('#progressPanel').hidden = true;
+    },
+  });
+}
+
+/* Once a run has ended the tracking folds itself and the page goes to the
+   answer — once per run, so a person who opens the Live fold again keeps it. */
+function focusTheAnswer(snap) {
+  const live = RV.isLive(snap);
+  const panel = $('#progressPanel');
+  if (!panel) return;
+  if (live) { panel.dataset.open = '1'; return; }
+  if (state.focusedRun === snap.run_id) return;
+  state.focusedRun = snap.run_id;
+  panel.dataset.open = '0';
+  const head = panel.querySelector('.head');
+  if (head) head.setAttribute('aria-expanded', 'false');
+  setTimeout(() => {
+    const target = $('#resultPanel');
+    if (target && !target.hidden) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, 350);
+}
+
+async function stopRun(runId) {
+  try { await post(`/api/discovery/${runId}/cancel`); }
+  catch (e) { fail(e); }
+}
+
+/* More time for a live run, within the deployment's bounds. The server says no
+   when there is none to give, and that answer is shown rather than swallowed. */
+async function extendRun(runId) {
+  try { await post(`/api/discovery/${runId}/extend`); }
+  catch (e) { fail(e); }
+}
+
+/* Hold a live run: the agents stop between events and the clock stops with
+   them. Continuing gives the run back the time it had. */
+async function pauseRun(runId) {
+  try { await post(`/api/discovery/${runId}/pause`); }
+  catch (e) { fail(e); }
+}
+
+/* The next round: results come back, and a fresh run starts from this one's
+   files. It throws so the form can show why a follow-up was refused. */
+async function followUpRun(runId, body) {
+  const d = await post(`/api/discovery/${runId}/follow-up`, body);
+  if (d && d.run_id) watchRun(d.run_id);
+}
+
+/* Continue a run. A paused one resumes in place; an ended one comes back as a
+   fresh run seeded with its artifacts, and the tracker follows the new one. */
+async function continueRun(runId) {
+  try {
+    const d = await post(`/api/discovery/${runId}/continue`);
+    if (d && d.run_id && d.run_id !== runId) watchRun(d.run_id);
+  } catch (e) { fail(e); }
+}
+
+/* The stop button beside "Run", visible exactly while the watched run is live —
+   so stopping a run never depends on scrolling to the live panel. */
+function showStop(snap) {
+  const b = $('#stopBtn'); if (!b) return;
+  const live = !!snap && RV.isLive(snap) && snap.cancellable !== false;
+  b.hidden = !live;
+  if (!live) { b.disabled = false; b.textContent = 'Stop run'; delete b.dataset.run; return; }
+  if (b.dataset.run !== snap.run_id) { b.disabled = false; b.textContent = 'Stop run'; }
+  b.dataset.run = snap.run_id;
+}
+
+function stopFromButton() {
+  const b = $('#stopBtn'); const id = b && b.dataset.run;
+  if (!id) return;
+  if (state.run && state.run.paused) { b.disabled = true; b.textContent = 'finishing…'; stopRun(id); return; }
+  if (!confirm('Stop this run?\n\nThe orchestrator and every specialist still working are '
+    + 'interrupted. Whatever they have already written is kept, and the run is recorded as '
+    + 'stopped — not as an answer.')) return;
+  b.disabled = true; b.textContent = 'stopping…';
+  stopRun(id);
+}
+
+/* What the bioinformatics agent is doing, from its own files: the analyses it
+   planned (question, dataset, tool, the uncertainty it targets), what came
+   back, and its running notes. */
+let bioSeen = '';
+/* A finding arrives as text, as {finding, basis}, or as that object already
+   serialised to a string by whatever wrote the result. Each shape reads as
+   the finding, with its statistics beneath it — never as raw JSON. */
+function findingLine(f) {
+  if (typeof f === 'string' && f.trim().startsWith('{')) {
+    try { f = JSON.parse(f); } catch (_) { /* plain text that starts with a brace */ }
+  }
+  const box = el('div');
+  if (typeof f === 'string') { box.append('• ' + f); return box; }
+  box.append('• ' + (f.finding || f.statement || f.summary || JSON.stringify(f)));
+  if (f.basis) box.append(el('div', 'dim', f.basis));
+  return box;
+}
+
+/* A compact table whose rows open: each row is one line a reader can scan, and
+   clicking it (or Enter on it) unfolds the full text beneath, across the table.
+   rows: [{cells: [text|Node], detail: Node|null, key}] — open rows are remembered. */
+function foldTable(headers, rows, cls) {
+  const t = el('table', 'ft' + (cls ? ' ' + cls : ''));
+  const hr = el('tr'); hr.append(el('th', 'ft-car'));
+  headers.forEach(h => hr.append(el('th', null, h)));
+  t.append(hr);
+  rows.forEach(r => {
+    const tr = el('tr', 'ft-row');
+    const car = el('td', 'ft-car', r.detail ? '▸' : '');
+    tr.append(car);
+    r.cells.forEach(c => {
+      const td = el('td');
+      if (c instanceof Node) td.append(c); else td.textContent = c == null ? '' : String(c);
+      // What a closed row cuts short is readable on hover, and in full when open.
+      td.querySelectorAll('.clip').forEach(n => { if (!n.title) n.title = n.textContent; });
+      tr.append(td);
+    });
+    t.append(tr);
+    if (!r.detail) return;
+    const dr = el('tr', 'ft-detail');
+    const td = el('td'); td.colSpan = headers.length + 1; td.append(r.detail);
+    dr.append(td); t.append(dr);
+    const set = open => { dr.hidden = !open; car.textContent = open ? '▾' : '▸';
+      tr.classList.toggle('open', open); tr.setAttribute('aria-expanded', String(open)); };
+    set(r.key ? rememberedOpen(r.key, false) : false);
+    tr.tabIndex = 0;
+    const toggle = () => { const open = dr.hidden; set(open); if (r.key) rememberOpen(r.key, open); };
+    tr.addEventListener('click', toggle);
+    tr.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+  });
+  return t;
+}
+function kv(label, text, cls) {
+  if (text == null || text === '' || (Array.isArray(text) && !text.length)) return null;
+  const d = el('div', 'ft-kv' + (cls ? ' ' + cls : ''));
+  d.append(el('span', 'ft-k', label));
+  if (text instanceof Node) d.append(text); else d.append(el('span', null, String(text)));
+  return d;
+}
+function appendAll(host, nodes) { nodes.filter(Boolean).forEach(n => host.append(n)); return host; }
+function oneLine(f) {
+  if (typeof f === 'string' && f.trim().startsWith('{')) { try { f = JSON.parse(f); } catch (_) { /* text */ } }
+  return typeof f === 'string' ? f : (f && (f.finding || f.statement || f.summary)) || '';
+}
+
+function renderBioInsights(bio) {
+  const host = $('#bioInsights'); if (!host) return;
+  const key = JSON.stringify(bio || null);
+  if (key === bioSeen) return;
+  bioSeen = key;
+  host.textContent = '';
+  if (!bio) return;
+  (bio.specialists || []).forEach(sp => {
+    const d = el('details', 'ins-sub');
+    d.dataset.key = 'bio:' + sp.name;
+    d.open = rememberedOpen(d.dataset.key, false);
+    d.addEventListener('toggle', () => rememberOpen(d.dataset.key, d.open));
+    const sm = el('summary');
+    sm.append(el('b', null, sp.label || sp.name),
+      el('span', 'dim', '  ' + (sp.updated_at ? `notes ${BS.fmt.ago(sp.updated_at)}` : 'no notes yet')));
+    d.append(sm);
+    const body = el('div', 'insights'); d.append(body);
+    if (sp.text) renderNotes(body, sp.text, 'bio-' + sp.name);
+    host.append(d);
+  });
+  host.append(analysisTable(bio));
+  if (bio.notes) {
+    host.append(el('div', 'lab', 'Running notes'));
+    const notes = el('div', 'insights'); host.append(notes);
+    renderNotes(notes, bio.notes.text, 'bio');
+  }
+}
+
+/* Every analysis on one line: what it asks, on which data, where it stands,
+   what it found and how far that carries. Open a row for the uncertainty it
+   settles, the findings, the analyst's reading and its caveats. A plan, its
+   result and the interpretation of that result are joined by their ids. */
+function analysisTable(bio) {
+  const results = bio.results || [], interps = bio.interpretations || [];
+  const usedR = new Set(), usedI = new Set();
+  const interpFor = r => {
+    // analysis_ref is the result's id or the path of its file.
+    const ref = i => String(i.analysis_ref || '').split('/').pop();
+    const k = interps.findIndex((i, n) => !usedI.has(n) && ((r.analysis_id && ref(i) === r.analysis_id)
+      || (r.file && ref(i) === r.file) || (!i.analysis_ref && i.question && i.question === r.question)));
+    if (k < 0) return null; usedI.add(k); return interps[k];
+  };
+  const items = [];
+  (bio.plans || []).forEach(p => {
+    const k = results.findIndex((r, n) => !usedR.has(n) && r.plan_ref && r.plan_ref === p.plan_id);
+    const r = k >= 0 ? (usedR.add(k), results[k]) : null;
+    items.push({ p, r, i: r ? interpFor(r) : null });
+  });
+  results.forEach((r, n) => { if (!usedR.has(n)) items.push({ p: null, r, i: interpFor(r) }); });
+  (bio.agent_analyses || []).forEach(a => items.push({ a }));
+  interps.forEach((i, n) => { if (!usedI.has(n)) items.push({ i }); });
+  if (!items.length) return el('p', 'dim', 'No analysis planned yet.');
+
+  const rows = items.map(({ p, r, i, a }, n) => {
+    const q = (p && p.question) || (r && r.question) || (a && a.question) || (i && i.question) || '—';
+    const data = p ? [(p.datasets || []).join(', '), p.tool].filter(Boolean).join(' · ')
+      : a ? 'agent-written script' : r && r.source ? r.source : '';
+    let status, cls;
+    if (a) { status = a.succeeded ? 'script' : 'failed'; cls = a.succeeded ? 'warn' : 'gap'; }
+    else if (i) { status = 'read'; cls = 'reported'; }
+    else if (r) { status = 'done'; cls = 'reported'; }
+    else { status = 'planned'; cls = ''; }
+    const headline = a ? (a.succeeded ? oneLine((a.findings || [])[0]) : a.problem || '')
+      : i && i.what_it_shows ? i.what_it_shows : r ? oneLine((r.key_findings || [])[0]) : '';
+    const conf = (i && i.confidence) || (r && r.confidence) || (a && a.succeeded ? 'low' : '');
+    const confNode = conf ? el('span', 'conf ' + conf, conf) : '';
+
+    const d = el('div', 'ft-body');
+    if (p) appendAll(d, [kv('Settles', p.uncertainty), kv('Why', p.why), kv('Decision', p.decision_relevance),
+      kv('Analysis', [p.analysis_type, p.tool].filter(Boolean).join(' · ')),
+      kv('Data', (p.datasets || []).join(', '))]);
+    if (r) {
+      if ((r.key_findings || []).length) {
+        const f = el('div'); r.key_findings.forEach(x => f.append(findingLine(x)));
+        d.append(kv('Found', f));
+      }
+      (r.limitations || []).forEach(l => d.append(kv('Limitation', l, 'dim')));
+    } else if (p) d.append(kv('Result', 'not run yet', 'dim'));
+    if (a) {
+      appendAll(d, [kv('Method', a.method), a.succeeded ? null : kv('Problem', a.problem)]);
+      if ((a.findings || []).length) { const f = el('div'); a.findings.forEach(x => f.append(findingLine(x))); d.append(kv('Found', f)); }
+      d.append(el('div', 'dim', 'A script the analyst wrote, run here; its confidence is capped at low.'));
+    }
+    if (i) {
+      const tr = i.transfer || {};
+      appendAll(d, [kv('Shows', i.what_it_shows), kv('For this process', i.meaning_for_process),
+        kv('Recommends', i.recommendation),
+        kv('Transfer', `cells ${tr.cells}, stage ${tr.stage}, treatment ${tr.treatment}`
+          + (tr.species ? `, ${tr.species}` : '') + (tr.notes ? ` (${tr.notes})` : ''), 'dim'),
+        i.confidence_claimed && i.confidence_claimed !== i.confidence
+          ? kv('Confidence', `claimed ${i.confidence_claimed}; capped by ${(i.confidence_capped_by || []).join('; ')}`, 'dim') : null,
+        kv('Would confirm it', i.confirm_with, 'dim'),
+        kv('Caveats', (i.caveats || []).join('; '), 'dim')]);
+    }
+    const qc = el('div'); qc.append(el('span', 'clip', q));
+    if (data) qc.append(el('div', 'ft-sub', data));
+    return { cells: [qc, el('span', 'tag ' + cls, status),
+      el('span', 'clip', headline || '—'), confNode], detail: d.childNodes.length ? d : null,
+      key: 'an:' + ((p && p.plan_id) || (r && r.analysis_id) || (a && a.analysis_id) || n) };
+  });
+  const t = foldTable(['Analysis', 'Status', 'Result', 'Conf.'], rows, 'ft-an');
+  const box = el('div');
+  box.append(el('p', 'ft-note', 'Status: planned → done (the tool ran) → read (the analyst '
+    + 'interpreted it, confidence capped). Open a row for what it settles, what it found and '
+    + 'what it means here.'), t);
+  return box;
+}
+
+/* Wild type against the engineered line the run asked about, as the agents ran
+   it on the reactor: the assumed effect stated first, then the curves. */
+let genoSeen = '';
+/* What the run could not settle, as the next experiment at the bench: the
+   unknowns, the arms against one control, what to measure, and what the next
+   run does with each outcome — fixed before any result exists. */
+let planSeen = '';
+function renderRoundPlan(p, snap) {
+  const host = $('#roundInsights'); if (!host) return;
+  const key = JSON.stringify([p, snap && snap.measurements, snap && snap.status]);
+  if (key === planSeen) return;
+  planSeen = key;
+  host.textContent = '';
+  host.append(el('p', null, p.purpose || ''));
+  const arms = p.arms || [], rules = p.decision_rules || [];
+  const armIds = arms.map(a => a.arm_id);
+  // Which arms a rule speaks about, from its own words ("if A1 raises … over A0").
+  const armsIn = text => armIds.filter(id => new RegExp(`\\b${id}\\b`).test(text || ''));
+  const control = arms.find(a => a.control) || {};
+  const fmt = v => v == null ? '—' : String(v);
+
+  /* The unknowns, each opening to what the next run does with every outcome. */
+  host.append(el('div', 'lab', 'What this round settles'));
+  host.append(foldTable(['Unknown', 'Arms', 'Outcomes'], (p.unknowns || []).map(u => {
+    const mine = rules.filter(r => r.unknown === u.id);
+    const tested = [...new Set(mine.flatMap(r => armsIn(`${r.if} ${r.then}`)))];
+    const d = el('div', 'ft-body');
+    appendAll(d, [kv('Unresolved because', u.why_unresolved), kv('Levers', (u.levers || []).join(', '))]);
+    if (mine.length) {
+      const rt = el('table', 'ft-rules');
+      const hr = el('tr'); hr.append(el('th', null, 'If'), el('th', null, 'Then the next run'));
+      rt.append(hr);
+      mine.forEach(r => { const tr = el('tr'); tr.append(el('td', null, r.if), el('td', null, r.then)); rt.append(tr); });
+      d.append(rt);
+    }
+    const name = el('span'); name.append(el('span', 'tag', u.id), ' ', el('span', 'clip', u.question));
+    return { cells: [name, tested.join(', ') || '—', mine.length ? `${mine.length} rule(s)` : 'none'],
+      detail: d, key: `rp:${p.commitment_sha256 || ''}:${u.id}` };
+  }), 'ft-rp'));
+
+  /* The arms: only what differs from the control on the line; open for what the
+     arm does and every setpoint. Identical columns are noise, not information. */
+  const levers = [...new Set(arms.flatMap(a => Object.keys(a.setpoints || {})))];
+  host.append(el('div', 'lab', `Arms · ${p.replicates} replicate(s) each`));
+  host.append(foldTable(['Arm', 'Differs from control in', 'Tests'], arms.map(a => {
+    const sp = a.setpoints || {}, csp = control.setpoints || {};
+    const diff = a.control ? [] : levers.filter(l => l in sp && fmt(sp[l]) !== fmt(csp[l]));
+    const tests = [...new Set(rules.filter(r => armsIn(`${r.if} ${r.then}`).includes(a.arm_id)).map(r => r.unknown))];
+    const d = el('div', 'ft-body');
+    d.append(kv('What it does', a.basis || (a.control ? 'The current process, unchanged: every other arm is compared with it.' : '')));
+    if (Object.keys(sp).length) {
+      const chips = el('div', 'ft-chips');
+      Object.entries(sp).forEach(([k, v]) => chips.append(el('span', 'chip' + (diff.includes(k) ? ' on' : ''), `${k} ${fmt(v)} [D]`)));
+      d.append(kv('Setpoints', chips));
+    }
+    const label = el('span'); label.append(el('b', null, a.arm_id), ' ', el('span', 'clip',
+      a.label + (a.control && !/control/i.test(a.label) ? ' (control)' : '')));
+    return { cells: [label,
+      a.control ? 'the reference' : diff.length ? diff.map(l => `${l} ${fmt(sp[l])}`).join(', ')
+        : el('span', 'dim', 'no registered setpoint — see what it does'),
+      tests.join(', ') || '—'], detail: d, key: `arm:${p.commitment_sha256 || ''}:${a.arm_id}` };
+  }), 'ft-rp'));
+  const meas = el('div', 'ft-chips');
+  (p.readouts || []).forEach(r => meas.append(el('span', 'chip', `${r.name} · ${r.unit} · ${r.when}`)));
+  host.append(kv('Measure', meas));
+  if ((p.limitations || []).length) {
+    const lim = el('details', 'ins-sub');
+    lim.append(el('summary', null, `Limitations (${p.limitations.length})`));
+    p.limitations.forEach(l => lim.append(el('div', 'dim', l)));
+    host.append(lim);
+  }
+  host.append(el('p', 'dim', (p.status || '') + ' Rules fixed before any result existed'
+    + (p.commitment_sha256 ? ` (sha256 ${p.commitment_sha256.slice(0, 12)}…)` : '') + '. '
+    + 'When you have results, use "Follow up with results" on this run.'));
+  if (snap && !RV.isLive(snap)) host.append(runTheRound(p, snap));
+}
+
+/* Running the round: two routes in, one record. A connected bioreactor (not
+   yet: the panel shows how the experiment would be assembled and sends
+   nothing), or a scientist entering what they measured against the plan's own
+   arms and readouts. Either way each value keeps its source. */
+/* The conditions this run surfaced, as a menu to design a round from. The
+   list is evidence, not a recommendation to act on: a dose shows only where a
+   source gave one, and registering a condition is what lets a protocol carry
+   its value. */
+const CLASS_LABEL = { necessary: 'Necessary', potential: 'Potential',
+  experimental: 'Experimental' };
+function conditionPicker(cat) {
+  const wrap = el('div', 'cond');
+  wrap.append(el('div', 'plan-lab', `Conditions this run surfaced (${cat.count})`));
+  const row = el('div', 'cond-row');
+  const sel = el('select', 'select cond-sel');
+  const first = el('option', null, 'Choose a condition to see what stands behind it…');
+  first.value = ''; sel.append(first);
+  const byKey = {};
+  cat.groups.forEach(g => {
+    const grp = el('optgroup');
+    grp.label = `${CLASS_LABEL[g.class] || g.class} — ${g.options.length}`;
+    g.options.forEach(o => {
+      byKey[o.key] = o;
+      const dose = o.value != null ? ` · ${num(o.value)}${o.unit ? ' ' + o.unit : ''}`
+        : ' · no dose established';
+      const opt = el('option', null, `${o.label}${dose}`);
+      opt.value = o.key; grp.append(opt);
+    });
+    sel.append(grp);
+  });
+  row.append(sel);
+  wrap.append(row);
+  const detail = el('div', 'cond-detail'); detail.hidden = true;
+  wrap.append(detail);
+  sel.addEventListener('change', () => {
+    const o = byKey[sel.value];
+    detail.textContent = '';
+    detail.hidden = !o;
+    if (!o) return;
+    const head = el('div', 'cond-head');
+    head.append(el('b', null, o.label));
+    head.append(el('span', 'tag ' + o.class, CLASS_LABEL[o.class] || o.class));
+    if (o.stage_id) head.append(el('span', 'chip', o.stage_id));
+    if (o.registered) head.append(el('span', 'tag ok', 'in the protocol'));
+    detail.append(head);
+    appendAll(detail, [
+      kv('Dose', o.value != null ? `${num(o.value)}${o.unit ? ' ' + o.unit : ''}`
+        + (o.value_from ? ` (${o.value_from})` : '')
+        : 'no source in this run gives one — it would be a design choice'),
+      kv('Stands on', o.source),
+      kv('Detail', o.detail),
+      kv('Cites', (o.refs || []).join(', ')),
+    ]);
+    const why = (cat.groups.find(g => g.class === o.class) || {}).why;
+    if (why) detail.append(el('p', 'caveat', why));
+    if (!o.registered) {
+      detail.append(el('p', 'caveat', 'This project has no parameter for it, so the protocol '
+        + 'cannot carry its dose yet. Add it from the stage boxes in the Plan to change that.'));
+    }
+  });
+  wrap.append(el('p', 'caveat', cat.note));
+  return wrap;
+}
+
+function runTheRound(p, snap) {
+  const box = el('div', 'm round-run');
+  box.append(el('b', null, `Run round ${p.round || 1}`));
+  const reps = Math.max(1, p.replicates || 1);
+  const arms = p.arms || [], readouts = p.readouts || [];
+
+  const send = el('button', 'btn more', 'Send to bioreactor');
+  send.title = 'The instrument interface is not connected yet. This shows how the experiment '
+    + 'would be assembled; nothing is sent.';
+  const enter = el('button', 'btn more', 'Enter results');
+  const act = el('div', 'rv-actions'); act.append(send, enter);
+  /* This round on one page, from where it is planned: arms down, stages
+     across, every change from the control shaded. */
+  if (snap && snap.run_id && snap.result && snap.result.protocol) {
+    act.append(exportLink(snap.run_id, 'pdf', 'This round on one page (PDF)', '&view=plan'),
+      exportLink(snap.run_id, 'docx', 'Word', '&view=plan'));
+  }
+  box.append(act);
+
+  const inst = el('div', 'rv-follow-box'); inst.hidden = true;
+  inst.append(RV.assembly(p));
+  send.addEventListener('click', () => { inst.hidden = !inst.hidden; });
+  box.append(inst);
+
+  const form = el('div', 'rv-follow-box'); form.hidden = true;
+  form.append(el('p', 'dim', 'One value per arm, replicate and readout, as measured. Leave a '
+    + 'cell empty if it was not measured. A value entered again replaces the earlier one, '
+    + 'which is kept as a correction.'));
+  const t = el('table', 'rp-arms');
+  const hr = el('tr'); ['Arm', 'Rep', ...readouts.map(r => `${r.name} (${r.unit})`)].forEach(h => hr.append(el('th', null, h)));
+  t.append(hr);
+  const have = {};
+  ((snap.measurements || {}).entries || []).filter(e => e.source === 'scientist')
+    .forEach(e => { have[`${e.arm_id}|${e.replicate}|${e.readout}`] = e.value; });
+  const inputs = [];
+  arms.forEach(a => { for (let r = 1; r <= reps; r++) {
+    const tr = el('tr');
+    tr.append(el('td', null, a.arm_id + (a.control ? ' (control)' : '')), el('td', null, String(r)));
+    readouts.forEach(ro => {
+      const i = el('input'); i.type = 'number'; i.step = 'any';
+      const k = `${a.arm_id}|${r}|${ro.name}`;
+      if (k in have) i.value = have[k];
+      inputs.push({ i, arm_id: a.arm_id, replicate: r, readout: ro.name });
+      const td = el('td'); td.append(i); tr.append(td);
+    });
+    t.append(tr);
+  } });
+  form.append(t);
+  const save = el('button', 'btn go', 'Save results');
+  const msg = el('span', 'dim');
+  save.addEventListener('click', async () => {
+    const entries = inputs.filter(x => x.i.value.trim() !== '')
+      .map(x => ({ arm_id: x.arm_id, replicate: x.replicate, readout: x.readout, value: Number(x.i.value) }));
+    if (!entries.length) { msg.textContent = ' Enter at least one value.'; return; }
+    save.disabled = true; save.textContent = 'saving…';
+    try {
+      await post(`/api/discovery/${encodeURIComponent(snap.run_id)}/results`, { entries });
+      msg.textContent = ` Saved ${entries.length} value(s).`;
+      if (state.run && state.run.run_id === snap.run_id) watchRun(snap.run_id);
+    } catch (e) { msg.textContent = ' ' + (e.message || e); }
+    save.disabled = false; save.textContent = 'Save results';
+  });
+  const row = el('div', 'rv-actions'); row.append(save, msg);
+  form.append(row);
+  enter.addEventListener('click', () => { form.hidden = !form.hidden; });
+  box.append(form);
+
+  /* Measurements: what came back, by source. Empty until something does. */
+  const m = snap.measurements;
+  const meas = el('div', 'm');
+  meas.append(el('b', null, 'Measurements'));
+  meas.append(el('div', 'dim', 'From the bioreactor: not connected — nothing received.'));
+  const sci = (m && m.by_source && m.by_source.scientist) || 0;
+  meas.append(el('div', 'dim', `Entered by a scientist: ${sci ? sci + ' value(s)' : 'none yet'}`
+    + (m && m.corrections ? ` (${m.corrections} correction(s) kept)` : '') + '.'));
+  if (m && (m.means || []).length) {
+    const mt = el('table', 'rp-arms');
+    const mh = el('tr'); ['Arm', 'Readout', 'n', 'Mean'].forEach(h => mh.append(el('th', null, h)));
+    mt.append(mh);
+    m.means.forEach(x => {
+      const tr = el('tr');
+      [x.arm_id, x.readout, String(x.n), Number(x.mean).toPrecision(4)].forEach(c => tr.append(el('td', null, c)));
+      mt.append(tr);
+    });
+    meas.append(mt);
+    meas.append(el('div', 'dim', 'The follow-up run compares each arm with the control using '
+      + 'the statistics tool, then applies the rules above as they were written.'));
+  }
+  box.append(meas);
+  return box;
+}
+
+/* Terms the run proposed for levers the base reactor has no equation for: the
+   project's own simulator, one term at a time. Each says what it computes and
+   what it cites; it joins the project only when a person adds it. */
+/* How close the product is expected to come to the real cell, axis by axis.
+   Every axis is shown, including the ones nobody addressed: an unknown is the
+   finding. A row opens on what development does, what the protocol does, the
+   reasons, and the assay that would settle it. */
+const SIM_CLS = { high: 'ok', moderate: 'warn', low: 'bad', unknown: 'mut' };
+const MATCH_LABEL = { close: 'Expected close to the real cell',
+  partial: 'Expected a partial match', distant: 'Expected distant from the real cell',
+  unknown: 'How close it would be is not established' };
+let fidSeen = '';
+function renderFidelity(f) {
+  const host = $('#fidInsights'); if (!host) return;
+  const key = JSON.stringify(f);
+  if (key === fidSeen) return;
+  fidSeen = key; host.textContent = '';
+  const ov = f.overall || {}, ref = f.in_vivo_reference || {};
+  const head = el('div', 'fid-head ' + (ov.expected_match || ''));
+  head.append(el('div', 'route-lab', MATCH_LABEL[ov.expected_match] || ''));
+  head.append(el('div', null, ov.summary || ''));
+  const judged = el('div', 'dim fid-ref');
+  judged.append(document.createTextNode('Judged against: '));
+  judged.append(el('b', null, ref.cell || '—'));
+  if (ref.stage_of_life) judged.append(el('span', 'chip', ref.stage_of_life));
+  if (ref.why_this_one) judged.append(el('div', null, ref.why_this_one));
+  head.append(judged);
+  host.append(head);
+
+  host.append(foldTable(['Axis', 'Expected', 'Settled by'], (f.criteria || []).map(c => {
+    const sim = el('span', 'tag ' + (SIM_CLS[c.expected_similarity] || ''),
+      c.expected_similarity);
+    const settle = el('span');
+    settle.append(document.createTextNode(clipText(c.measured_by, 34)));
+    if (c.in_round_plan) settle.append(el('span', 'tag brand', ' in this round'));
+    const detail = appendAll(el('div'), [
+      kv('In vivo', c.in_vivo),
+      kv('This protocol', c.protocol),
+      c.departure ? kv('Departure', c.departure) : null,
+      kv('Why', (c.reasons || []).join(' ')),
+      kv('Settled by', c.measured_by + (c.in_round_plan ? ' — in this round\'s plan'
+        : ' — not measured by this run')),
+      kv('Confidence', c.confidence),
+      (c.refs || []).length ? kv('Cites', c.refs.join(', ')) : null,
+    ]);
+    const nm = el('span');
+    nm.append(el('b', null, c.label || c.axis));
+    if (c.axis === ov.dominant_gap) nm.append(el('span', 'tag bad', ' biggest gap'));
+    return { key: 'fid:' + c.axis, cells: [nm, sim, settle], detail };
+  }), 'fid'));
+  if (ov.what_would_settle_it) {
+    host.append(el('p', 'caveat', 'What would settle it: ' + ov.what_would_settle_it));
+  }
+  host.append(el('p', 'caveat', 'Expectations about cells that have not been made yet — not '
+    + 'measurements. An axis marked unknown is one this run could not speak to.'));
+  (f.limitations || []).forEach(l => host.append(el('p', 'caveat', l)));
+}
+
+/* The published route, stage by stage: what the established protocol puts in
+   the medium before this run changes anything. The plan shows these rows
+   inline; this is the long form, with what each factor does and the sentence
+   each dose rests on. */
+const ROLE_CLS = { essential: 'bad', supporting: 'warn', optional: 'mut' };
+let baseSeen = '';
+function renderBaseline(b) {
+  const host = $('#baseInsights'); if (!host) return;
+  const key = JSON.stringify(b);
+  if (key === baseSeen) return;
+  baseSeen = key; host.textContent = '';
+  const c = b.coverage || {};
+  const head = el('div');
+  head.append(el('b', null, b.cell_type || ''));
+  if (b.route) head.append(el('span', 'dim', ' · ' + b.route));
+  if (b.base_medium) head.append(el('div', 'dim', 'Base medium: ' + b.base_medium));
+  head.append(el('div', 'dim', `${c.stages_addressed || 0} of ${c.stages_total || 0} stages have `
+    + `factors · ${c.reported || 0} of ${c.factors || 0} carry a reported dose · `
+    + `${c.gaps || 0} gap(s) · ${c.already_parameters || 0} already a parameter of this project`));
+  host.append(head);
+
+  (b.stages || []).forEach(st => {
+    host.append(el('div', 'plan-lab', st.label + (st.addressed ? '' : ' — not established')));
+    host.append(el('p', 'dim', st.purpose));
+    if (!(st.factors || []).length) return;
+    host.append(foldTable(['Factor', 'Dose', 'Stands on'], st.factors.map(f => {
+      const nm = el('span');
+      nm.append(el('b', null, f.name));
+      nm.append(el('span', 'tag ' + (ROLE_CLS[f.role] || 'mut'), ' ' + f.role));
+      if (f.in_project) nm.append(el('span', 'tag brand', ' a parameter here'));
+      const dose = f.value == null ? (f.provenance === 'gap' ? 'no dose established' : '—')
+        : `${num(f.value)}${f.unit ? ' ' + f.unit : ''}`;
+      const stands = el('span', 'pl ' + f.provenance, f.provenance);
+      const detail = appendAll(el('div'), [
+        kv('What it does', f.why),
+        f.timing ? kv('When', f.timing) : null,
+        f.adapted_from ? kv('Adapted from', f.adapted_from) : null,
+        f.what_to_search ? kv('To settle it, search', f.what_to_search) : null,
+        f.in_project ? kv('In this project', f.in_project + ' — the protocol can carry its dose')
+          : kv('Not a parameter here', 'register it in the project and the protocol can carry '
+            + 'its dose; until then it is a condition to design the run around'),
+        ...(f.sources || []).map(x => kv(x.ref + (x.locator ? ' · ' + x.locator : ''),
+          '“' + x.quote + '”' + (x.context ? ' — ' + x.context : ''))),
+      ]);
+      return { key: 'base:' + st.stage_id + ':' + f.factor_id,
+        cells: [nm, dose, stands], detail };
+    }), 'base'));
+  });
+  host.append(el('p', 'caveat', b.note));
+  (b.limitations || []).forEach(l => host.append(el('p', 'caveat', l)));
+}
+
+/* The specialist mode's phase 2: which way of making the cell this run chose.
+   The choice and its reasons first, then every candidate scored against each
+   criterion — a row opens on its outline, numbers and why it was not chosen. */
+const FIT_CLS = { meets: 'ok', partial: 'warn', fails: 'bad', unknown: 'mut' };
+const FIT_MARK = { meets: '✓', partial: '~', fails: '✕', unknown: '?' };
+const ROUTE_KIND = { directed_differentiation: 'directed differentiation',
+  forward_programming: 'forward programming', transdifferentiation: 'transdifferentiation',
+  primary_expansion: 'primary expansion', cell_line: 'cell line',
+  organoid_derived: 'organoid-derived', other: 'other' };
+let routeSeen = '';
+function renderRoute(r) {
+  const host = $('#routeInsights'); if (!host) return;
+  const key = JSON.stringify(r);
+  if (key === routeSeen) return;
+  routeSeen = key; host.textContent = '';
+  const crits = ((r.need || {}).criteria) || [];
+  const byId = {}; crits.forEach(c => { byId[c.criterion_id] = c; });
+  const chosen = (r.candidates || []).find(c => c.route_id === (r.chosen || {}).route_id);
+  const why = {}; (r.alternatives || []).forEach(a => { why[a.route_id] = a; });
+
+  const head = el('div', 'route-chosen');
+  head.append(el('div', 'route-lab', 'This run researched'));
+  head.append(el('b', null, chosen ? chosen.label : (r.chosen || {}).route_id || ''));
+  if (chosen) head.append(el('span', 'chip', ROUTE_KIND[chosen.kind] || chosen.kind));
+  if ((r.chosen || {}).why) head.append(el('div', null, r.chosen.why));
+  if (r.chosen && r.chosen.fits_project === false) {
+    head.append(el('p', 'caveat', 'This route is not one the project can run as it stands: '
+      + (r.chosen.project_note || '') + ' The protocol still uses the project\'s own '
+      + 'parameters; changing the system is a person\'s decision.'));
+  }
+  host.append(head);
+
+  /* Whether the need as written is what is limiting the answer. Said beside
+     the answer, never instead of it: the protocol still serves what was asked. */
+  const na = r.need_assessment || {};
+  if (na.verdict && na.verdict !== 'well_matched') {
+    const box = el('div', 'need-note ' + na.verdict);
+    box.append(el('div', 'route-lab', na.verdict === 'suboptimal'
+      ? 'What you asked for is not the strongest route the evidence reports'
+      : 'Something in the request rules out a stronger-reported route'));
+    box.append(el('div', null, na.summary || ''));
+    (na.trade_offs || []).forEach(t => {
+      const c = (byId[t.criterion_id] || {}).criterion || t.criterion_id;
+      const cand = (r.candidates || []).find(x => x.route_id === t.route_id) || {};
+      const row = el('div', 'trade');
+      row.append(el('b', null, `Relax "${c}"`));
+      row.append(el('div', null, `→ ${cand.label || t.route_id}: ${t.would_gain}`));
+      row.append(el('div', 'dim', `Costs: ${t.would_cost}`
+        + ((t.refs || []).length ? ' [' + t.refs.join(', ') + ']' : '')));
+      box.append(row);
+    });
+    box.append(el('p', 'caveat', 'The plan below still answers the need as you wrote it, '
+      + 'optimised as far as the evidence allows inside it. This is a note, not a substitution.'));
+    host.append(box);
+  }
+
+  const hr = r.headroom || {};
+  if ((hr.levers || []).length) {
+    host.append(el('div', 'lab', 'Where the gain is inside this route'));
+    if (hr.summary) host.append(el('p', 'dim', hr.summary));
+    const ul = el('ul', 'tight');
+    (hr.levers || []).forEach(l => {
+      const li = el('li');
+      li.append(el('b', null, l.lever));
+      if (l.stage_id) li.append(el('span', 'chip', l.stage_id));
+      li.append(el('div', null, l.why));
+      if (l.bounded_by) li.append(el('div', 'dim', 'Bounded by: ' + l.bounded_by));
+      ul.append(li);
+    });
+    host.append(ul);
+  }
+
+  if (crits.length) {
+    host.append(el('div', 'lab', 'What the route had to satisfy'));
+    const ul = el('ul', 'tight');
+    crits.forEach(c => {
+      const li = el('li');
+      li.append(document.createTextNode(c.criterion + ' '));
+      if (c.must) li.append(el('span', 'tag warn', 'must'));
+      li.append(el('div', 'dim', 'from: ' + c.source));
+      ul.append(li);
+    });
+    host.append(ul);
+  }
+
+  if ((r.candidates || []).length) {
+    host.append(el('div', 'lab', 'Every route considered'));
+    const heads = ['Route', 'Starting from'].concat(crits.map(c => c.criterion_id));
+    host.append(foldTable(heads, r.candidates.map(c => {
+      const scores = {}; (c.fit || []).forEach(f => { scores[f.criterion_id] = f; });
+      const name = el('span');
+      name.append(el('b', null, c.label));
+      name.append(el('span', 'chip ' + c.maturity, c.maturity));
+      if (c.route_id === (r.chosen || {}).route_id) name.append(el('span', 'tag brand', ' chosen'));
+      else if ((why[c.route_id] || {}).worth_a_parallel_arm) {
+        name.append(el('span', 'tag', ' worth an arm'));
+      }
+      const cells = [name, clipText(c.starting_material, 22)].concat(crits.map(cr => {
+        const f = scores[cr.criterion_id] || { verdict: 'unknown' };
+        const m = el('span', 'fit ' + (FIT_CLS[f.verdict] || ''), FIT_MARK[f.verdict] || '?');
+        m.title = `${cr.criterion}: ${f.verdict}` + (f.note ? ' — ' + f.note : '');
+        return m;
+      }));
+      const rep = c.reported || {};
+      const detail = appendAll(el('div'), [
+        kv('How it works', c.summary),
+        kv('Reported', [rep.yield && `yield: ${rep.yield}`, rep.purity && `purity: ${rep.purity}`,
+          rep.timeline && `timeline: ${rep.timeline}`, rep.scale && `scale: ${rep.scale}`,
+          rep.format && `format: ${rep.format}`].filter(Boolean).join('; ')),
+        (c.fit || []).some(f => f.note)
+          ? kv('Fit', (c.fit || []).filter(f => f.note).map(f =>
+            `${(byId[f.criterion_id] || {}).criterion || f.criterion_id}: ${f.verdict} — ${f.note}`)
+            .join('; ')) : null,
+        (c.limits || []).length ? kv('Limits', c.limits.join('; ')) : null,
+        why[c.route_id] ? kv('Not chosen because', why[c.route_id].why_not) : null,
+        kv('Cites', (c.refs || []).join(', ')),
+      ]);
+      return { key: 'route:' + c.route_id, cells, detail };
+    }), 'routes'));
+  }
+  const rv = r.review || {};
+  if (rv.reviewed_by || (rv.disagreements || []).length) {
+    host.append(el('p', 'caveat', `Fit reviewed by ${rv.reviewed_by || 'nobody'}`
+      + (rv.note ? ': ' + rv.note : '')
+      + ((rv.disagreements || []).length ? ' Open: ' + rv.disagreements.join('; ') : '')));
+  }
+  (r.limitations || []).forEach(l => host.append(el('p', 'caveat', l)));
+}
+
+/* The state-of-the-art add-on: the recommended protocol against the leading
+   published ways the cell is made. The standing comes first, then the
+   comparison (a difference carries only an expected effect, never a result),
+   then the reference protocols with their reported numbers. */
+const STANDING_LABEL = { matches_sota: 'Matches the state of the art',
+  variant_of_sota: 'A variant of the state of the art',
+  departs_from_sota: 'Departs from the state of the art' };
+const ROUTE_LABEL = { directed_differentiation: 'directed differentiation',
+  forward_programming: 'forward programming', transdifferentiation: 'transdifferentiation',
+  primary_isolation: 'primary isolation', other: 'other' };
+const VERDICT_CLS = { same: 'ok', differs: 'warn', novel: 'brand', not_comparable: 'mut' };
+let sotaSeen = '';
+function renderSota(s) {
+  const host = $('#sotaInsights'); if (!host) return;
+  const key = JSON.stringify(s);
+  if (key === sotaSeen) return;
+  sotaSeen = key; host.textContent = '';
+  const st = s.standing || {};
+  const head = el('div', 'sota-standing ' + (st.verdict || ''));
+  head.append(el('b', null, STANDING_LABEL[st.verdict] || st.verdict || ''));
+  if (st.summary) head.append(el('div', null, st.summary));
+  host.append(head);
+  const comps = s.comparisons || [];
+  if (comps.length) {
+    host.append(el('div', 'lab', 'This protocol vs the field'));
+    host.append(foldTable(['', 'This protocol', 'State of the art', 'Verdict'], comps.map(c => {
+      const v = el('span', 'tag ' + (VERDICT_CLS[c.verdict] || ''), c.verdict);
+      const e = c.expected_effect;
+      const detail = appendAll(el('div'), [
+        c.difference ? kv('Difference', c.difference) : null,
+        kv('State of the art', c.state_of_the_art + ((c.ref_ids || []).length
+          ? ` [${c.ref_ids.join(', ')}]` : '')),
+        e ? kv('Expected effect', `${e.readout}: ${e.direction} (${e.confidence} confidence) — `
+          + e.basis + ((e.refs || []).length ? ' [' + e.refs.join(', ') + ']' : '')) : null,
+        e && e.hypothesis_id ? kv('Became hypothesis', e.hypothesis_id) : null,
+      ]);
+      return { key: 'sota:' + c.dimension, cells: [c.dimension, c.this_protocol,
+        oneLineClip(c.state_of_the_art, 48), v], detail };
+    }), 'other'));
+    host.append(el('p', 'caveat', 'A difference carries an expected effect — a hypothesis with '
+      + 'its basis — never a measured gain: this model is uncalibrated.'));
+  }
+  if ((s.references || []).length) {
+    host.append(el('div', 'lab', 'Leading published protocols'));
+    host.append(foldTable(['Protocol', 'Route', 'Reported'], s.references.map(r => {
+      const rep = r.reported || {};
+      const line = [rep.yield && `yield ${rep.yield}`, rep.purity && `purity ${rep.purity}`,
+        rep.timeline && rep.timeline].filter(Boolean).join(' · ');
+      const name = el('span');
+      name.append(el('b', null, r.citation));
+      if (r.is_benchmark) name.append(el('span', 'tag brand', ' benchmark'));
+      const detail = appendAll(el('div'), [
+        kv('Summary', r.summary),
+        (r.key_factors || []).length ? kv('Factors', r.key_factors.join(', ')) : null,
+        kv('Reported', [rep.yield && `yield: ${rep.yield}`, rep.purity && `purity: ${rep.purity}`,
+          rep.timeline && `timeline: ${rep.timeline}`, rep.scale && `scale: ${rep.scale}`,
+          rep.format && `format: ${rep.format}`].filter(Boolean).join('; ')),
+        kv('Cites', (r.refs || []).join(', ')),
+      ]);
+      return { key: 'sref:' + r.ref_id, cells: [name, ROUTE_LABEL[r.route] || r.route,
+        oneLineClip(line, 46)], detail };
+    }), 'other'));
+  }
+  (s.limitations || []).forEach(l => host.append(el('p', 'caveat', l)));
+}
+function oneLineClip(t, n) {
+  t = String(t || '');
+  return t.length > n ? t.slice(0, n - 1) + '…' : t;
+}
+
+/* The developmental-biology add-on: each stage beside the embryo, and the
+   ideas development suggests. The ideas table opens on each idea's rationale,
+   what was searched, and how its novelty and confidence were set. */
+let devSeen = '';
+const DEV_STATE = { on: '●', off: '○', rising: '↑', falling: '↓', pulse: '⇡',
+  gradient: '▱', inhibited: '⊘' };
+function renderDevMap(dev) {
+  const host = $('#devInsights'); if (!host) return;
+  const key = JSON.stringify(dev);
+  if (key === devSeen) return;
+  devSeen = key; host.textContent = '';
+  const head = el('p', 'dim');
+  head.append(el('b', null, dev.cell_type || ''));
+  if (dev.species_basis) head.append(document.createTextNode(` · from ${dev.species_basis}`));
+  host.append(head);
+  if ((dev.stages || []).length) {
+    host.append(el('div', 'lab', 'Each stage against development'));
+    host.append(foldTable(['Stage', 'In vivo counterpart', 'Signals'], dev.stages.map(s => {
+      const sig = (s.signals || []).map(x => `${DEV_STATE[x.state] || ''} ${x.name}`).join(', ');
+      const detail = appendAll(el('div'), [
+        kv('When', s.timing),
+        (s.signals || []).length ? kv('Signals', (s.signals || []).map(x =>
+          `${x.name} ${x.state}${x.window ? ' (' + x.window + ')' : ''} — ${(x.refs || []).join(', ')}`
+        ).join('; ')) : null,
+        (s.regulators || []).length ? kv('Regulators', (s.regulators || []).map(x =>
+          `${x.gene}: ${x.role}`).join('; ')) : null,
+        (s.perturbations || []).length ? kv('Loss / gain of function', (s.perturbations || []).map(x =>
+          `${x.gene} ${x.type} (${x.model}): ${x.phenotype}`).join('; ')) : null,
+        (s.protocol_vs_development || []).length ? kv('Protocol departs',
+          s.protocol_vs_development.join(' ')) : null,
+      ]);
+      return { key: 'dev:' + s.stage_id, cells: [s.stage_id, s.in_vivo_counterpart, sig], detail };
+    })));
+  }
+  if ((dev.ideas || []).length) {
+    host.append(el('div', 'lab', 'Ideas development suggests'));
+    host.append(el('p', 'caveat', 'Hypotheses to test, not findings: each rests on the embryo '
+      + 'by mechanism or analogy, with its novelty stated as what was searched.'));
+    host.append(foldTable(['Lever', 'Stage', 'Do', 'Confidence'], dev.ideas.map(i => {
+      const nov = el('span'); nov.append(el('b', null, i.lever + ' '),
+        el('span', 'tag', i.novelty || ''));
+      const detail = appendAll(el('div'), [
+        kv('Why', i.rationale),
+        kv('Development cites', (i.developmental_refs || []).join(', ')),
+        kv('Searched the protocols for', ((i.protocol_search || {}).queries || []).join('; ')),
+        i.confidence_note ? kv('Confidence', i.confidence + ' — ' + i.confidence_note) : null,
+        kv('Test', i.test),
+        i.hypothesis_id ? kv('Became hypothesis', i.hypothesis_id) : null,
+      ]);
+      return { key: 'idea:' + i.idea_id, cells: [nov, i.stage_id, i.action, i.confidence], detail };
+    }), 'other'));
+  }
+  (dev.limitations || []).forEach(l => host.append(el('p', 'caveat', l)));
+}
+
+let termsSeen = '';
+function renderProposedTerms(t, runId) {
+  const host = $('#termsInsights'); if (!host) return;
+  const key = JSON.stringify(t) + runId;
+  if (key === termsSeen) return;
+  termsSeen = key;
+  host.textContent = '';
+  host.append(el('p', 'dim', t.status || ''));
+  (t.terms || []).forEach(term => {
+    const d = term.description || {};
+    const row = el('div', 'm');
+    row.append(el('span', 'tag warn', d.badge || 'DE NOVO'), ' ',
+      el('b', null, `${term.label}${term.unit ? ' (' + term.unit + ')' : ''}`));
+    row.append(el('div', null, d.summary || ''));
+    if (term.stage) row.append(el('div', 'dim', `acts in: ${term.stage}`));
+    if (d.basis) row.append(el('div', 'dim', 'Basis: ' + d.basis));
+    if ((d.references || []).length) row.append(el('div', 'dim', 'Cites: ' + d.references.join(', ')));
+    const add = el('button', 'btn more', 'Add to my project');
+    add.title = 'Adds this term to your project as proposed (DE NOVO, uncalibrated). Every '
+      + 'later run and the Simulator then play it in its stage.';
+    const msg = el('span', 'dim');
+    add.addEventListener('click', async () => {
+      add.disabled = true; add.textContent = 'adding…';
+      try {
+        await post(`/api/projects/${encodeURIComponent(t.project_id)}/terms/adopt`,
+          { run_id: runId, parameter_id: term.parameter_id });
+        add.textContent = 'Added to your project';
+        msg.textContent = ' — accepted by you, still uncalibrated.';
+      } catch (e) { add.disabled = false; add.textContent = 'Add to my project'; msg.textContent = ' ' + (e.message || e); }
+    });
+    const act = el('div', 'rv-actions'); act.append(add, msg);
+    row.append(act);
+    host.append(row);
+  });
+  if (t.note) host.append(el('p', 'dim', t.note));
+}
+
+function renderGenoInsight(g) {
+  const host = $('#genoInsights'); if (!host) return;
+  const key = g ? JSON.stringify([g.verdict, g.assumption]) : '';
+  if (key === genoSeen) return;
+  genoSeen = key; host.textContent = '';
+  if (!g) return;
+  const gt = g.genotype || {};
+  const factor = gt.kind === 'factor';
+  const label = factor ? 'with ' + (gt.label || 'the factor') : (gt.label || 'edited line');
+  const control = g.control_label || (factor ? 'without it' : 'wild type');
+  if (g.stand_in) host.append(el('p', 'warnc', g.stand_in_note || 'BUILT ON THE BASE REACTOR.'));
+  if (g.assumption) host.append(el('p', 'caveat', 'Assumed: ' + g.assumption));
+  if (g.verdict) host.append(el('p', 'm', g.verdict));
+  const curves = el('div'); host.append(curves);
+  BSCurves.render(curves, g.curves, { aLabel: control, bLabel: label });
+  const tab = el('table', 'dtab'); host.append(tab);
+  BSCurves.table(tab, g.deltas, [control, label]);
+  if ((g.not_represented || []).length) {
+    host.append(el('p', 'dim', 'Not represented in the reactor: ' + g.not_represented.join(', ')));
+  }
+}
+
+function hasPartial(r) {
+  const b = (r && r.bundle) || {};
+  return !!(r.protocol || (b.hypotheses || []).length || (b.artifacts_ingested || 0) > 0);
+}
+
+/* The literature agent's running notes and the papers it found, live. These
+   are leads written while reading, shown before the orchestrator has weighed
+   them; the panel says so, and never calls them findings. */
+let insightsSeen = '';
+/* Setpoints a run collected for the process reference: each with its value, its
+   vessel and the quoted source. An admin promotes them under their own name;
+   until then they are only an unreviewed, low-confidence starting value. */
+let refSeen = '';
+function renderReferenceDraft(snap) {
+  const sec = $('#refSec'); if (!sec) return;
+  const d = snap.reference_draft;
+  sec.hidden = !d;
+  if (!d) return;
+  wireSection('refSec', true);
+  const key = JSON.stringify(d);
+  if (key === refSeen) return;
+  refSeen = key;
+  $('#refSum').textContent = `${d.entries.length} entr${d.entries.length === 1 ? 'y' : 'ies'}`
+    + (d.errors.length ? ` · ${d.errors.length} to fix` : '');
+  const host = $('#refDraft'); host.textContent = '';
+  d.entries.forEach(e => {
+    const row = el('div', 'm');
+    const v = e.typical != null ? `${e.typical} ${e.unit || ''}` : (e.range ? `${e.range.lower}–${e.range.upper} ${e.unit || ''}` : '—');
+    row.append(el('b', null, `${e.parameter_id}: ${v}`), el('span', 'dim',
+      `  ${e.basis || '?'} · ${e.confidence || '?'}${e.vessel ? ' · ' + e.vessel : ''}`));
+    (e.sources || []).forEach(src => {
+      const q = el('div', 'dim'); const href = sourceLink(src.ref);
+      if (href) { const a = el('a', null, src.ref); a.href = href; a.target = '_blank'; a.rel = 'noopener'; q.append(a); }
+      else q.append(el('code', null, src.ref || '?'));
+      q.append(` — “${src.quote}”`); row.append(q);
+    });
+    host.append(row);
+  });
+  d.errors.forEach(x => host.append(el('p', 'bad', x)));
+  const who = state.identity || BS.state.identity || {};
+  if (!snap.finished_at || !d.entries.length) return;
+  const form = el('div', 'rv-actions');
+  const name = el('input'); name.type = 'text'; name.placeholder = 'Your name, as the reviewer';
+  name.className = 'refname';
+  const go = el('button', 'btn go', 'Promote to the process reference');
+  go.disabled = !!d.errors.length;
+  go.title = d.errors.length ? 'Fix the entries above first' : 'Admin only: adds these entries under your name';
+  go.addEventListener('click', async () => {
+    if (!name.value.trim()) { name.focus(); return; }
+    if (!confirm(`Promote ${d.entries.length} entr${d.entries.length === 1 ? 'y' : 'ies'} under the name "${name.value.trim()}"?\n\nEvery later run will use them as starting values, labelled with their source.`)) return;
+    go.disabled = true; go.textContent = 'promoting…';
+    try {
+      const r = await post(`/api/discovery/${snap.run_id}/promote-reference`, { reviewed_by: name.value.trim() });
+      host.append(el('p', 'ok', `Promoted: ${r.promoted.join(', ')}`));
+      go.textContent = 'promoted';
+    } catch (e) { go.disabled = false; go.textContent = 'Promote to the process reference'; fail(e); }
+  });
+  form.append(name, go);
+  host.append(form);
+}
+/* A by-stage search: each stage agent's notes, folding on their own. */
+let stagesSeen = '';
+function renderLitStages(rows) {
+  const host = $('#litStages'); if (!host) return;
+  const key = JSON.stringify(rows.map(r => [r.stage, r.updated_at, r.papers]));
+  if (key === stagesSeen) return;
+  stagesSeen = key; host.textContent = '';
+  rows.forEach(r => {
+    const d = el('details', 'ins-sub');
+    d.dataset.key = 'stage:' + r.stage;
+    d.open = rememberedOpen(d.dataset.key, false);
+    d.addEventListener('toggle', () => rememberOpen(d.dataset.key, d.open));
+    const sm = el('summary');
+    sm.append(el('b', null, r.stage), el('span', 'dim', '  ' + [r.papers != null ? `${r.papers} papers` : null,
+      r.updated_at ? `notes ${BS.fmt.ago(r.updated_at)}` : 'no notes yet'].filter(Boolean).join(' · ')));
+    d.append(sm);
+    const body = el('div', 'insights'); d.append(body);
+    if (r.notes) renderNotes(body, r.notes, 'lit-' + r.stage);
+    host.append(d);
+  });
+}
+/* A light reading of the agents' notes: headings, rules, **bold**, `code`
+   and list items. Text only — nothing from a note is ever parsed as HTML. */
+function inlineMd(text) {
+  const frag = document.createDocumentFragment();
+  const parts = String(text).split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+  parts.forEach(t => {
+    if (!t) return;
+    if (t.startsWith('**') && t.endsWith('**') && t.length > 4) frag.append(el('strong', null, t.slice(2, -2)));
+    else if (t.startsWith('`') && t.endsWith('`') && t.length > 2) frag.append(el('code', null, t.slice(1, -1)));
+    else frag.append(document.createTextNode(t));
+  });
+  return frag;
+}
+function mdBlock(text, host) {
+  let list = null;
+  text.split('\n').forEach(raw => {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim()) { list = null; return; }
+    if (/^-{3,}$/.test(line.trim())) { list = null; return; }
+    const h = line.match(/^#{1,4}\s+(.*)$/);
+    if (h) { list = null; const n = el('div', 'md-h'); n.append(inlineMd(h[1])); host.append(n); return; }
+    const li = line.match(/^\s*[-*•]\s+(.*)$/);
+    if (li) {
+      if (!list) { list = el('ul', 'tight'); host.append(list); }
+      const n = el('li'); n.append(inlineMd(li[1])); list.append(n); return;
+    }
+    list = null;
+    const n = el('p', 'md-p'); n.append(inlineMd(line)); host.append(n);
+  });
+}
+/* A note file as foldable entries: what comes before the first second-level
+   heading is the preface; every "## ..." section folds on its own, closed. */
+function renderNotes(host, text, kind) {
+  host.textContent = '';
+  const lines = String(text || '').split('\n');
+  const pre = [], secs = [];
+  let cur = null;
+  lines.forEach(l => {
+    const m = l.match(/^##\s+(.*)$/);
+    if (m) { cur = { title: m[1], body: [] }; secs.push(cur); }
+    else if (cur) cur.body.push(l);
+    else if (!/^#\s/.test(l)) pre.push(l);
+  });
+  if (pre.join('').trim()) { const p = el('div', 'ins-pre'); mdBlock(pre.join('\n'), p); host.append(p); }
+  if (!secs.length && !pre.join('').trim()) { mdBlock(text, host); return 0; }
+  secs.forEach((sec, i) => {
+    const d = el('details', 'ins-note');
+    d.dataset.key = `${kind}:${sec.title}`;
+    d.open = rememberedOpen(d.dataset.key, false);
+    d.addEventListener('toggle', () => rememberOpen(d.dataset.key, d.open));
+    const sm = el('summary'); sm.append(inlineMd(sec.title)); d.append(sm);
+    const b = el('div', 'ins-body'); mdBlock(sec.body.join('\n'), b); d.append(b);
+    host.append(d);
+  });
+  return secs.length;
+}
+/* Which sections a viewer keeps open, remembered in their own browser. */
+const OPEN_KEY = 'biosense.insightsOpen';
+function openState() { try { return JSON.parse(localStorage.getItem(OPEN_KEY) || '{}'); } catch (_) { return {}; } }
+function rememberedOpen(key, dflt) { const s = openState(); return key in s ? !!s[key] : dflt; }
+function rememberOpen(key, open) {
+  const s = openState(); s[key] = !!open;
+  const keys = Object.keys(s); if (keys.length > 200) keys.slice(0, keys.length - 200).forEach(k => delete s[k]);
+  try { localStorage.setItem(OPEN_KEY, JSON.stringify(s)); } catch (_) {}
+}
+function wireSection(id, dflt) {
+  const d = $('#' + id); if (!d || d.dataset.wired) return d;
+  d.dataset.wired = '1';
+  d.open = rememberedOpen(d.dataset.key, dflt);
+  d.addEventListener('toggle', () => rememberOpen(d.dataset.key, d.open));
+  return d;
+}
+
+/* What round 1 needs at the bench: the medium, the reagents, how the culture
+   is actually handled, and the mistakes that ruin it. The one thing to read
+   carefully is the sourcing column — a supplier and a catalogue number appear
+   only where a paper states them, because nobody checks a catalogue number
+   before ordering and a wrong one costs a week. */
+function renderBench(host, b) {
+  if (!host) return;
+  const box = el('div', 'bench');
+  box.append(el('div', 'plan-lab', 'At the bench'));
+  const c = b.coverage || {};
+  box.append(el('p', 'dim', [b.vessel,
+    `${c.stages_with_medium || 0}/${c.stages_total || 0} stages have a medium`,
+    `${c.reagents || 0} reagent(s), ${c.sourced || 0} with a supplier from a source`]
+    .filter(Boolean).join(' · ')));
+
+  if ((b.media || []).length) {
+    box.append(el('div', 'plan-lab', 'Medium, per stage'));
+    box.append(foldTable(['Stage', 'Base', 'Stands on'], b.media.map(m => ({
+      key: 'bm:' + m.stage_id,
+      cells: [m.stage_label || m.stage_id,
+        m.base_medium + (m.serum ? ` · ${m.serum}` : ''),
+        el('span', 'pl ' + m.provenance, m.provenance)],
+      detail: appendAll(el('div'), [
+        kv('Supplements', (m.supplements || []).join(' · ')),
+        m.prepare ? kv('Make it up', m.prepare) : null,
+        m.note ? kv('Note', m.note) : null,
+        ...(m.sources || []).map(x => kv(x.ref + (x.locator ? ' · ' + x.locator : ''),
+          '\u201c' + x.quote + '\u201d')),
+      ]),
+    })), 'bench'));
+  }
+
+  if ((b.reagents || []).length) {
+    box.append(el('div', 'plan-lab', 'Reagents'));
+    box.append(foldTable(['Reagent', 'At', 'Where from'], b.reagents.map(r => {
+      const from = r.sourcing === 'from_source'
+        ? el('span', 'tag ok amount', [r.supplier, r.catalogue].filter(Boolean).join(' '))
+        : el('span', 'tag mut', 'your own stock');
+      return {
+        key: 'br:' + r.name,
+        cells: [r.name, r.working_concentration || '—', from],
+        detail: appendAll(el('div'), [
+          kv('What it is for', r.role),
+          r.stock ? kv('Stock', r.stock) : null,
+          r.storage ? kv('Storage', r.storage) : null,
+          r.handling ? kv('Handling', r.handling) : null,
+          r.sourcing === 'from_source' ? null
+            : kv('Supplier', 'No source read by this run names one, so use your own '
+              + 'qualified stock and record the lot. A catalogue number with nothing '
+              + 'behind it is not written here.'),
+          r.note ? kv('Note', r.note) : null,
+          ...(r.sources || []).map(x => kv(x.ref + (x.locator ? ' · ' + x.locator : ''),
+            '\u201c' + x.quote + '\u201d')),
+        ]),
+      };
+    }), 'bench'));
+  }
+
+  if ((b.handling || []).length) {
+    box.append(el('div', 'plan-lab', 'How it is run'));
+    b.handling.forEach(h => {
+      const row = el('div', 'fmtrow');
+      const top = el('div');
+      top.append(el('b', null, h.step));
+      if (h.when) top.append(el('span', 'dim', ` · ${h.when}`));
+      if (h.duration) top.append(el('span', 'dim', ` · ${h.duration}`));
+      top.append(el('span', 'pl ' + h.provenance, h.provenance));
+      row.append(top, el('div', null, h.what));
+      box.append(row);
+    });
+  }
+
+  [['do', 'Do'], ['dont', 'Do not']].forEach(([key, label]) => {
+    if (!(b[key] || []).length) return;
+    box.append(el('div', 'plan-lab', label));
+    b[key].forEach(r => {
+      const row = el('div', 'fmtrow ' + key);
+      row.append(el('div', null, r.rule));
+      row.append(el('div', 'dim', r.why));
+      box.append(row);
+    });
+  });
+
+  if ((b.consumables || []).length) {
+    box.append(el('div', 'plan-lab', 'Consumables'));
+    const ul = el('ul', 'tight');
+    b.consumables.forEach(x => ul.append(el('li', null, x)));
+    box.append(ul);
+  }
+  (b.safety || []).forEach(x => box.append(el('p', 'caveat', x)));
+  (b.limitations || []).forEach(x => box.append(el('p', 'caveat', x)));
+  box.append(el('p', 'caveat', b.note));
+  host.append(box);
+}
+
+/* Round 1 is what happens next, so it is a section of its own rather than a
+   fold among the insights: the arms, and — once the run has written one — the
+   media, reagents, handling and the two mistakes that ruin it. */
+function renderRound(snap) {
+  const panel = $('#roundPanel'); if (!panel) return;
+  const plan = snap.round_plan;
+  panel.hidden = !plan;
+  if (!plan) return;
+  renderRoundPlan(plan, snap);
+  $('#roundTitle').textContent = `Round ${plan.round || 1} at the bench`;
+  $('#roundSum').textContent = `${(plan.unknowns || []).length} unknown(s) · `
+    + `${(plan.arms || []).length} arms × ${plan.replicates} · PROPOSED`;
+  const bench = snap.bench_setup;
+  if (bench) renderBench($('#roundInsights'), bench);
+}
+
+function renderInsights(snap) {
+  const panel = $('#insightsPanel'); if (!panel) return;
+  const ins = snap.insights, papers = snap.papers_found || [], bio = snap.bioinformatics;
+  const geno = snap.genotype_simulation;
+  const terms = snap.proposed_terms;
+  const dev = snap.developmental_map;
+  const sota = snap.sota_comparison;
+  const route = snap.route_selection;
+  const fid = snap.cell_fidelity;
+  const base = snap.baseline_protocol;
+  const analysed = $('#anaSec') && !$('#anaSec').hidden;
+  if (!ins && !papers.length && !bio && !geno && !terms && !dev && !sota && !route
+      && !fid && !base && !snap.reference_draft && !analysed) {
+    panel.hidden = true; return;
+  }
+  panel.hidden = false;
+  wireSection('litSec', false); wireSection('papersSec', false);
+  wireSection('bioSec', false); wireSection('genoSec', true); wireSection('termsSec', true);
+  wireSection('devSec', true); wireSection('sotaSec', true);
+  wireSection('routeSec', true); wireSection('fidSec', true); wireSection('baseSec', true);
+  const baseOn = base && (base.stages || []).length;
+  $('#baseSec').hidden = !baseOn;
+  if (baseOn) {
+    renderBaseline(base);
+    const c = base.coverage || {};
+    $('#baseSum').textContent = [`${c.stages_addressed || 0}/${c.stages_total || 0} stages`,
+      `${c.factors || 0} factor(s)`, c.gaps ? `${c.gaps} gap(s)` : null]
+      .filter(Boolean).join(' · ');
+  }
+  const fidOn = fid && (fid.criteria || []).length;
+  $('#fidSec').hidden = !fidOn;
+  if (fidOn) {
+    renderFidelity(fid);
+    const ov = fid.overall || {};
+    $('#fidSum').textContent = [ov.expected_match,
+      ov.dominant_gap ? 'gap: ' + ov.dominant_gap.replace(/_/g, ' ') : null]
+      .filter(Boolean).join(' · ');
+  }
+  const routeOn = route && (route.candidates || []).length;
+  $('#routeSec').hidden = !routeOn;
+  if (routeOn) {
+    renderRoute(route);
+    const ch = (route.candidates || []).find(c => c.route_id === (route.chosen || {}).route_id);
+    const v = (route.need_assessment || {}).verdict;
+    $('#routeSum').textContent = [ch && ch.label,
+      `${route.candidates.length} considered`,
+      v && v !== 'well_matched' ? v.replace(/_/g, ' ') : null].filter(Boolean).join(' · ');
+  }
+  const devOn = dev && ((dev.stages || []).length || (dev.ideas || []).length);
+  $('#devSec').hidden = !devOn;
+  if (devOn) {
+    renderDevMap(dev);
+    $('#devSum').textContent = [`${(dev.stages || []).length} stage(s)`,
+      (dev.ideas || []).length ? `${dev.ideas.length} idea(s)` : null].filter(Boolean).join(' · ');
+  }
+  const sotaOn = sota && (sota.references || []).length;
+  $('#sotaSec').hidden = !sotaOn;
+  if (sotaOn) {
+    renderSota(sota);
+    $('#sotaSum').textContent = [STANDING_LABEL[(sota.standing || {}).verdict] || '',
+      `${(sota.references || []).length} protocol(s)`].filter(Boolean).join(' · ');
+  }
+
+  $('#termsSec').hidden = !(terms && (terms.terms || []).length);
+  if (terms && (terms.terms || []).length) {
+    renderProposedTerms(terms, snap.run_id);
+    $('#termsSum').textContent = `${terms.terms.length} proposed · DE NOVO`;
+  }
+
+  $('#bioSec').hidden = !bio;
+  if (bio) {
+    renderBioInsights(bio);
+    $('#bioSum').textContent = [`${(bio.plans || []).length} planned`,
+      `${(bio.results || []).length + (bio.agent_analyses || []).length} run`,
+      (bio.interpretations || []).length ? `${bio.interpretations.length} interpreted` : null,
+      (bio.specialists || []).length ? `${bio.specialists.length} specialists` : null,
+      bio.notes ? `notes ${BS.fmt.ago(bio.notes.updated_at)}` : null]
+      .filter(Boolean).join(' · ');
+  }
+  $('#genoSec').hidden = !geno;
+  if (geno) {
+    renderGenoInsight(geno);
+    $('#genoSum').textContent = (geno.genotype || {}).label || '';
+  }
+
+  renderLitStages(snap.literature_stages || []);
+  renderReferenceDraft(snap);
+  renderSectionExports(snap);
+  const key = `${ins ? ins.updated_at : 0}:${papers.length}`;
+  if (key === insightsSeen) return;
+  insightsSeen = key;
+  $('#insightsHead').textContent = ins ? `updated ${BS.fmt.ago(ins.updated_at)}` : '';
+  $('#insightsNote').textContent = ins ? ins.note : '';
+  const n = ins ? renderNotes($('#insights'), ins.text, 'lit') : 0;
+  if (!ins) $('#insights').textContent = '';
+  $('#litSum').textContent = [n ? `${n} note${n === 1 ? '' : 's'}` : null,
+    papers.length ? `${papers.length} papers` : null].filter(Boolean).join(' · ');
+  $('#papersSum').textContent = papers.length ? `(${papers.length})` : '';
+  const list = $('#papersFound'); list.textContent = '';
+  if (!papers.length) list.append(el('p', 'dim', 'No search has been saved yet.'));
+  papers.forEach(p => {
+    const row = el('div', 'm');
+    const a = el('a', null, p.id || '?');
+    if (p.pmcid) a.href = `https://europepmc.org/articles/${p.pmcid}`;
+    else if (p.pmid) a.href = `https://pubmed.ncbi.nlm.nih.gov/${p.pmid}/`;
+    a.target = '_blank'; a.rel = 'noopener';
+    row.append(a, ` · ${p.year || '?'} · `, el('span', null, p.title));
+    const tags = [];
+    if (p.open_access === 'Y' || p.full_text_read) tags.push(p.full_text_read ? 'full text read' : 'open access');
+    if (p.cited_by) tags.push(`cited ${p.cited_by}`);
+    if (p.matched_queries > 1) tags.push(`${p.matched_queries} queries`);
+    if ((p.found_by || []).length > 1) tags.push(`found by ${p.found_by.join(', ')}`);
+    if (tags.length) row.append(el('div', 'dim', tags.join(' · ')));
+    list.append(row);
+  });
+}
+
+/* Events seen in a snapshot are replayed into the record feed once each, so a
+   reload shows the history rather than starting the feed empty. */
+const seenEvents = new Set();
+function seedEvent(e) {
+  const key = `${e.seq}`;
+  if (seenEvents.has(key)) return;
+  seenEvents.add(key);
+  pushEvent(e, { quiet: true });
+}
+
+function pushEvent(e, opts) {
+  if (!(opts && opts.quiet)) {
+    if (seenEvents.has(`${e.seq}`)) return;
+    seenEvents.add(`${e.seq}`);
+  }
+  const feed = $('#feed');
+  if (feed.firstElementChild && feed.firstElementChild.tagName === 'P') feed.textContent = '';
+  const row = el('div', 'ev');
+  row.append(el('div', 't', e.t != null ? e.t.toFixed(1) + 's' : ''));
+  const d = el('div', 'd');
+  const k = el('span', 'k', (e.kind || '').replace(/_/g, ' '));
+  d.append(k, document.createTextNode(e.simple || e.technical || ''));
+  if (e.simple && e.technical && e.simple !== e.technical) {
+    const t = el('div', 'tech'); t.textContent = e.technical; d.append(t);
+  }
+  row.append(d); feed.append(row);
+  feed.scrollTop = feed.scrollHeight;
+  $('#evCount').textContent = feed.querySelectorAll('.ev').length + ' events';
+  if (e.stage) {
+    const rows = $$('#stages .stg');
+    const i = rows.findIndex(r => r.dataset.stage === e.stage);
+    if (i >= 0) {
+      rows.forEach((r, j) => {
+        if (j < i) r.dataset.status = 'done';
+        else if (j === i) r.dataset.status = 'current';
+      });
+    }
+  }
+}
+
+function renderStages(progress) {
+  const host = $('#stages'); if (!host) return;
+  if (!progress) {
+    host.textContent = '';
+    host.append(el('li', 'dim', 'Nothing running yet.'));
+    return;
+  }
+  host.textContent = '';
+  const MARK = { done: '✓', current: '●', pending: '○', skipped: '–' };
+  progress.forEach(p => {
+    const li = el('li', 'stg'); li.dataset.status = p.status; li.dataset.stage = p.stage;
+    li.append(el('div', 'm', MARK[p.status] || '○'));
+    const b = el('div');
+    b.append(el('div', 'lbl', p.label));
+    b.append(el('div', 'bl', p.blurb));
+    li.append(b);
+    host.append(li);
+  });
+}
+
+/* ── results ─────────────────────────────────────────────────────────────── */
+/* Built once per result. The run page re-snapshots while it is open, and
+   rebuilding this DOM threw away whatever the reader had opened — the "Why"
+   fold shut itself a second after they clicked it. */
+let resultSeen = '';
+function renderResult(snap) {
+  const r = snap.result;
+  const key = snap.run_id + ':' + JSON.stringify(r);
+  if (key === resultSeen) { $('#resultPanel').hidden = false; return; }
+  resultSeen = key;
+  renderEvidence(r.bundle.evidence);
+  renderAnalyses(r.bundle.analyses);
+  renderHypothesis(r.bundle.selected_hypothesis, r.bundle.hypotheses, r.protocol);
+  renderCandidates(r.bundle.candidate_parameters);
+  if (r.protocol) renderProtocol(r.protocol);
+  renderOtherHypotheses(r.protocol, r.bundle.selected_hypothesis);
+  renderExports(snap);
+  const panel = $('#resultPanel'); panel.hidden = false;
+  const head = $('#resultHead'); head.textContent = '';
+  head.append(el('span', 'mut', `${r.bundle.artifacts_ingested} artifact(s) read`));
+  if ((r.bundle.artifacts_rejected || []).length) {
+    head.append(el('span', 'bad', ` · ${r.bundle.artifacts_rejected.length} could not be read`));
+  }
+  if (!r.bundle.hypotheses.length) {
+    head.append(el('p', 'caveat',
+      'This run produced no hypothesis that passed its contract. Nothing is shown rather than '
+      + 'a summary of what it might have found.'));
+  }
+}
+
+function renderEvidence(groups) {
+  const host = $('#evidence'); if (!host) return;
+  host.textContent = '';
+  const live = (groups || []).filter(g => g.count);
+  if (!live.length) { host.append(el('p', 'dim', 'No evidence was collected.')); }
+  live.forEach(g => {
+    const w = el('div', 'ds');
+    const h = el('div', 't'); h.append(term('evidence_class', g.evidence_class, g.label));
+    h.append(el('span', 'dim', `  ${g.count}`));
+    w.append(h);
+    g.items.slice(0, 6).forEach(it => {
+      const row = el('div', 'm');
+      row.textContent = it.summary || it.ref || '';
+      if (it.context_match === 'context_mismatch') {
+        row.append(' ');
+        row.append(el('span', 'warnc', 'CONTEXT MISMATCH'));
+        if (it.context_mismatch_note) row.append(el('div', 'dim', it.context_mismatch_note));
+      } else if (it.context_match === 'partial_match') {
+        row.append(' ');
+        row.append(el('span', 'warnc', 'PARTIAL CONTEXT MATCH'));
+        if (it.context_mismatch_note) row.append(el('div', 'dim', it.context_mismatch_note));
+      }
+      /* Indirect evidence is shown with its inference chain: the reader judges
+         the step from what the source shows to what the hypothesis claims. */
+      if (it.relevance && it.relevance !== 'direct') {
+        row.append(' ');
+        row.append(el('span', 'tag', it.relevance.toUpperCase()));
+        if (it.bearing) row.append(el('div', 'dim', 'Bears on it because: ' + it.bearing));
+      }
+      if (it.visibility) { row.append(' '); row.append(term('visibility', it.visibility)); }
+      w.append(row);
+    });
+    host.append(w);
+  });
+  $('#evidencePanel').hidden = false;
+}
+
+function renderAnalyses(cards) {
+  const host = $('#analyses'); if (!host) return;
+  host.textContent = '';
+  if (!cards.length) { $('#anaSec').hidden = true; return; }
+  cards.forEach(a => {
+    const w = el('div', 'hyp');
+    w.append(el('h4', null, a.question));
+    const meta = el('div', 'm');
+    meta.append(document.createTextNode(
+      (a.datasets || []).map(d => d.title || d.dataset_id).join(', ')));
+    if (a.method && a.method.label) meta.append(document.createTextNode(' · ' + a.method.label));
+    w.append(meta);
+    const badges = el('div', 'ev-row');
+    if (a.evidence_class) badges.append(term('evidence_class', a.evidence_class, null, 'ev'));
+    if (a.source_evidence_class && a.source_evidence_class !== a.evidence_class) {
+      badges.append(term('evidence_class', a.source_evidence_class,
+        'source: ' + a.source_evidence_class.replace(/_/g, ' '), 'ev'));
+    }
+    if (a.visibility) badges.append(term('visibility', a.visibility, null, 'ev'));
+    w.append(badges);
+    (a.findings || []).forEach(f => {
+      const row = el('div', 'eff');
+      row.append(el('div', null, f.text));
+      w.append(row);
+    });
+    (a.implications || []).slice(0, 1).forEach(i => {
+      w.append(el('div', 'lab', 'Interpretation'));
+      w.append(Object.assign(el('div'), { style: 'font-size:13.5px', textContent: i.text }));
+    });
+    const det = el('details');
+    det.append(el('summary', null, 'Technical details'));
+    const pre = el('pre');
+    pre.style.cssText = 'font-family:var(--mono);font-size:11.5px;overflow:auto;max-height:18rem';
+    pre.textContent = JSON.stringify({ method: a.method, comparison: a.comparison,
+      statistics: a.technical.statistics, quality_control: a.technical.quality_control,
+      provenance: a.technical.provenance }, null, 1);
+    det.append(pre);
+    w.append(det);
+    host.append(w);
+  });
+  /* The analyses are insights, read before the recommendation they feed. */
+  $('#anaSec').hidden = false;
+  $('#insightsPanel').hidden = false;
+  wireSection('anaSec', false);
+  $('#anaSum').textContent = `${cards.length} analysis${cards.length === 1 ? '' : 'es'}`;
+}
+
+function effectRow(e) {
+  if (e && e.magnitude_estimated === false) {
+    /* The honest shape of "we know which way, not how far". A blank row here
+       reads as a missing number; this reads as the claim it is. */
+    const row = el('div', 'eff');
+    const left = el('div', null);
+    left.append(el('div', null, e.label || e.metric));
+    if (e.withheld_reason) left.append(el('div', 'm', e.withheld_reason));
+    const amt = el('div', 'amt');
+    amt.append(el('span', 'notest', 'NOT ESTABLISHED'));
+    if (e.direction && e.direction !== 'unknown') {
+      amt.append(el('span', 'rel', `direction: ${e.direction}`));
+    }
+    amt.append(term('estimate_type', e.estimate_type, null, 'et ' + e.estimate_type));
+    row.append(left, amt);
+    return row;
+  }
+  return effectRowSized(e);
+}
+
+function effectRowSized(e) {
+  const r = el('div', 'eff');
+  if (e.estimate_type === 'judgement') return effectRowGuess(e, r);
+  r.append(el('div', null, e.label || e.metric));
+  const amt = el('div', 'amt');
+  if (!e.magnitude_estimated) {
+    amt.append(document.createTextNode(
+      'direction ' + (e.direction || 'unknown') + ', magnitude not estimated'));
+  } else {
+    const sign = e.absolute_change > 0 ? '+' : '';
+    amt.append(document.createTextNode(
+      sign + num(e.absolute_change, 4) + ' ' + (e.change_unit || '')));
+    if (e.relative_change_pct != null) {
+      amt.append(el('span', 'rel',
+        `  (${e.relative_change_pct > 0 ? '+' : ''}${e.relative_change_pct}%)`));
+    } else if (e.relative_withheld_reason) {
+      const s = el('span', 'rel', '  (relative change withheld)');
+      s.title = e.relative_withheld_reason; amt.append(s);
+    }
+  }
+  if (e.estimate_type) amt.append(term('estimate_type', e.estimate_type, null,
+    'et ' + e.estimate_type));
+  (e.model_basis || []).forEach(b => amt.append(term('model_basis', b, null, 'et')));
+  r.append(amt);
+  return r;
+}
+
+/* A best guess: a range and a confidence, never a bare number. It reads as a
+   guess on purpose, so nobody mistakes it for a measurement. */
+function effectRowGuess(e, r) {
+  const j = e.judgement || {};
+  const iv = e.interval || {};
+  const left = el('div', null);
+  left.append(el('div', null, e.label || e.metric));
+  if (j.rationale) left.append(el('div', 'm', j.rationale));
+  if (j.would_change_it) left.append(el('div', 'm', 'Would change it: ' + j.would_change_it));
+  const amt = el('div', 'amt');
+  const sgn = v => (v > 0 ? '+' : '') + num(v, 4);
+  amt.append(document.createTextNode(
+    `best guess ${sgn(iv.lower)} to ${sgn(iv.upper)} ${UNIT_SHORT[e.change_unit] || e.change_unit || ''}`));
+  if (e.absolute_change != null) amt.append(el('span', 'rel', `  (central ${sgn(e.absolute_change)})`));
+  amt.append(el('span', 'conf ' + (j.confidence || 'low'), (j.confidence || 'low') + ' confidence'));
+  amt.append(term('estimate_type', e.estimate_type, null, 'et ' + e.estimate_type));
+  r.append(left, amt);
+  return r;
+}
+
+/* The recommendation is always shown; how far to trust it sits right under
+   it, as a bar, with the reasons the code computed and the sources behind
+   them — supporting and contradicting — so "why high" or "why low" is
+   checkable without leaving the card. */
+const CONF_LEVELS = { low: 1, moderate: 2, high: 3 };
+function sourceLink(ref) {
+  const r = String(ref || '');
+  let m = r.match(/^PMC\d+$/);
+  if (m) return `https://europepmc.org/articles/${r}`;
+  m = r.match(/^PMID:?\s*(\d+)$/i);
+  if (m) return `https://pubmed.ncbi.nlm.nih.gov/${m[1]}/`;
+  m = r.match(/^(10\.\d{4,9}\/\S+)$/);
+  if (m) return `https://doi.org/${m[1]}`;
+  return null;
+}
+function confidenceBar(h) {
+  const level = h.confidence || 'low';
+  const box = el('div', 'confbox');
+  const top = el('div', 'confhead');
+  top.append(el('span', 'lab', 'Confidence'));
+  const bar = el('div', 'confbar ' + level);
+  for (let i = 1; i <= 3; i++) bar.append(el('span', i <= (CONF_LEVELS[level] || 1) ? 'on' : ''));
+  top.append(bar, el('span', 'conf ' + level, level));
+  box.append(top);
+  const why = el('ul', 'tight');
+  (h.confidence_basis || []).forEach(r => why.append(el('li', null, r)));
+  if (why.children.length) box.append(why);
+  const ev = (h.evidence || []).filter(e => e.stance === 'supportive' || e.stance === 'contradicting');
+  if (ev.length) {
+    const det = el('details');
+    const sup = ev.filter(e => e.stance === 'supportive').length;
+    det.append(el('summary', null,
+      `Backing sources: ${sup} supporting, ${ev.length - sup} contradicting`));
+    const ul = el('ul', 'tight');
+    ev.forEach(e => {
+      const li = el('li', e.stance === 'contradicting' ? 'contra' : null);
+      li.append(el('span', 'tag', e.stance === 'contradicting' ? 'AGAINST' : 'FOR'), ' ');
+      const href = sourceLink(e.ref);
+      if (href) {
+        const a = el('a', null, e.ref); a.href = href; a.target = '_blank'; a.rel = 'noopener';
+        li.append(a, ' — ');
+      } else if (e.ref) {
+        li.append(el('code', null, e.ref), ' — ');
+      }
+      li.append(document.createTextNode(e.summary || ''));
+      const bits = [e.strength && e.strength !== 'not_assessed' ? e.strength : null,
+        e.relevance,
+        e.context_match === 'partial_match' ? 'partial context match'
+          : e.context_match === 'context_mismatch' ? 'context mismatch' : null].filter(Boolean);
+      if (bits.length) li.append(el('span', 'dim', ` (${bits.join(' · ')})`));
+      if (e.bearing) li.append(el('div', 'dim', 'Bears on it because: ' + e.bearing));
+      ul.append(li);
+    });
+    det.append(ul); box.append(det);
+  }
+  return box;
+}
+
+function renderHypothesis(selected, all, protocol) {
+  const host = $('#hypothesis'); if (!host) return;
+  host.textContent = '';
+  if (!selected) {
+    /* "No hypothesis" with no reason is indistinguishable from a fault. Two
+       different things can be true here and they need different words: the
+       science withheld one, or the run never produced anything to form one
+       from. */
+    const diag = state.result && state.result.diagnosis;
+    if (diag) {
+      const box = el('div', 'diag');
+      box.append(el('h4', null, diag.headline));
+      box.append(el('p', null, diag.why));
+      const facts = [];
+      if (diag.turns) facts.push(`${diag.turns} orchestrator turn(s)`);
+      facts.push((diag.agents_dispatched || []).length
+        ? `agents asked: ${diag.agents_dispatched.join(', ')}`
+        : 'no specialist agent was asked');
+      facts.push((diag.files_written || []).length
+        ? `files written: ${diag.files_written.join(', ')}`
+        : 'no file written to the run directory');
+      box.append(el('p', 'dim mono', facts.join(' · ')));
+      if (diag.orchestrator_said) {
+        box.append(el('div', 'lab', 'What the orchestrator said last'));
+        box.append(el('blockquote', 'said', diag.orchestrator_said));
+      }
+      (diag.limitations || []).forEach(l => box.append(el('p', 'caveat', l)));
+      if ((diag.next_steps || []).length) {
+        const ul = el('ul', 'tight');
+        diag.next_steps.forEach(n => ul.append(el('li', null, n)));
+        box.append(el('div', 'lab', 'What to check'), ul);
+      }
+      host.append(box);
+      return;
+    }
+    const why = (state.result && state.result.bundle
+      && state.result.bundle.hypothesis_withheld_reason)
+      || (state.result && state.result.benchmark
+        && state.result.benchmark.hypothesis_withheld_reason);
+    host.append(el('p', 'dim', why || 'No hypothesis was formed by this run.'));
+    return;
+  }
+  /* The hypothesis first, in its own words: it is the claim, and the action
+     below is what the claim implies. The other way round — an instruction
+     with the science folded away behind "Why" — reads like an order from
+     something that cannot be questioned, which is the opposite of the point. */
+  const w = el('div', 'hyp lead');
+  host.append(w);
+  /* The claim level comes first, because it is what tells a reader how much
+     weight the sentence under it can carry. A CANDIDATE is a real output —
+     most useful hypotheses start there — and not a degraded QUANTIFIED one. */
+  const level = selected.claim_level || 'candidate';
+  const head = el('div', 'ev-row');
+  head.append(el('span', 'claim ' + level,
+    { candidate: 'CANDIDATE HYPOTHESIS', quantified: 'QUANTIFIED HYPOTHESIS',
+      simulated: 'SIMULATED PREDICTION' }[level] || level.toUpperCase()));
+  if (selected.parameter && selected.parameter.registered === false) {
+    head.append(el('span', 'flag', 'CANDIDATE PARAMETER — NOT YET REGISTERED'));
+  }
+  w.append(head);
+  w.append(el('h4', null, selected.statement));
+  w.append(confidenceBar(selected));
+  if (selected.claim_level_reason) {
+    w.append(el('p', 'caveat', selected.claim_level_reason));
+  }
+  /* What it means to do about it, in one line a person can act on. */
+  host.append(el('div', 'lab', 'What that means to do'));
+  host.append(recommendationCard(selected, protocol));
+
+  const why = el('details', 'rec-why');
+  why.append(el('summary', null, 'The parameter, every expected effect, and the evidence '
+    + 'behind each'));
+  const d = el('div', 'hyp');
+  why.append(d);
+  host.append(why);
+
+  const p = selected.parameter;
+  const move = el('div', 'move');
+  if (p.current_value != null && p.candidate_value != null) {
+    move.append(document.createTextNode(`${p.label || p.parameter_id}: ${p.current_value} → `));
+    move.append(Object.assign(el('b'), { textContent: String(p.candidate_value) }));
+    move.append(document.createTextNode(' ' + (p.unit || '')));
+  } else {
+    move.textContent = `${p.label || p.parameter_id}: ${p.direction || 'change'}`;
+  }
+  d.append(move);
+  const cov = el('div', 'ev-row');
+  cov.append(term('simulator_coverage', p.simulator_coverage, null, 'ev'));
+  cov.append(term('hypothesis_status', selected.status, null, 'ev'));
+  d.append(cov);
+  if (p.coverage_note) d.append(el('p', 'caveat', p.coverage_note));
+  d.append(el('div', 'lab', 'Expected effects'));
+  (selected.effects || []).forEach(e => d.append(effectRow(e)));
+  (selected.trade_offs || []).forEach(t => {
+    if (t.summary) d.append(el('p', 'caveat', 'Trade-off: ' + t.summary));
+  });
+  const confLab = el('div', 'lab');
+  confLab.append(document.createTextNode('Evidence · confidence '));
+  confLab.append(document.createTextNode(selected.confidence || 'unstated'));
+  d.append(confLab);
+  (selected.evidence || []).forEach(ev => {
+    const row = el('div', 'hev');
+    row.append(term('evidence_class', ev.evidence_class, ev.label, 'cls'));
+    row.append(el('div', null, ev.summary || ''));
+    d.append(row);
+  });
+  const nx = selected.next_experiment || {};
+  if (nx.summary) {
+    d.append(el('div', 'lab', 'Recommended next experiment'));
+    d.append(Object.assign(el('div'), { style: 'font-size:13.5px', textContent: nx.summary }));
+  }
+  if ((all || []).length > 1) {
+    host.append(el('p', 'caveat',
+      `${all.length} hypotheses were formed; the other ${all.length - 1}, and what became of `
+      + 'each, are under Other hypotheses.'));
+  }
+}
+
+/* One line per expected effect: which way, how far if anyone knows, and how
+   that number was reached. The full rows are in the fold under the card. */
+const UNIT_SHORT = { percentage_points: 'pp' };
+function effectLine(e) {
+  const label = String(e.label || e.metric || '').replace(/_/g, ' ');
+  e = Object.assign({}, e, { change_unit: UNIT_SHORT[e.change_unit] || e.change_unit });
+  const arrow = { increase: '↑', decrease: '↓', no_change: '→' }[e.direction] || '?';
+  const sgn = v => (v > 0 ? '+' : '') + num(v, 4);
+  if (e.estimate_type === 'judgement') {
+    const iv = e.interval || {}, j = e.judgement || {};
+    return `${label}: best guess ${sgn(iv.lower)} to ${sgn(iv.upper)} ${e.change_unit || ''}`
+      + ` (${j.confidence || 'low'} confidence)`;
+  }
+  if (e.magnitude_estimated === false || e.absolute_change == null) {
+    return `${label}: ${arrow} expected, size not established`;
+  }
+  return `${label}: ${arrow} ${sgn(e.absolute_change)} ${e.change_unit || ''}`
+    + (e.relative_change_pct != null ? ` (${sgn(e.relative_change_pct)}%)` : '')
+    + ` · ${String(e.estimate_type || '').toUpperCase()}`;
+}
+function clip(text, n) {
+  const t = String(text || '').trim();
+  return t.length > n ? t.slice(0, n - 1).replace(/\s+\S*$/, '') + '…' : t;
+}
+/* The recommendation as the action it asks for, then what to expect and how
+   sure it is — short enough to read in one look. */
+function recommendationCard(h, protocol) {
+  const p = h.parameter || {};
+  const card = el('div', 'rec');
+  const action = ((protocol || {}).actions || {})[h.hypothesis_id]
+    || `${p.direction === 'decrease' ? 'Lower' : 'Raise'} ${p.label || p.parameter_id}`
+      + (p.candidate_value != null ? ` to ${num(p.candidate_value)} ${p.unit || ''}` : '');
+  card.append(el('div', 'rec-act', action));
+  const meta = el('div', 'rec-meta');
+  meta.append(el('span', 'chip', h.hypothesis_id));
+  meta.append(el('span', 'chip', (h.claim_level || 'candidate') + ' hypothesis'));
+  meta.append(miniBar(h.confidence), el('span', 'dim', (h.confidence || 'unstated') + ' confidence'));
+  if (p.in_project === false || p.registered === false) {
+    meta.append(el('span', 'chip warn', 'not yet a parameter of this project'));
+  }
+  card.append(meta);
+  const effects = h.effects || [];
+  if (effects.length) {
+    card.append(el('div', 'rec-lab', 'Expect'));
+    const ul = el('ul', 'rec-list');
+    effects.forEach(e => ul.append(el('li', null, effectLine(e))));
+    card.append(ul);
+  }
+  const nx = (h.next_experiment || {}).summary;
+  if (nx) {
+    card.append(el('div', 'rec-lab', 'Test it'));
+    card.append(el('p', 'rec-test', clip(nx, 220)));
+  }
+  return card;
+}
+
+/* What the run could not fetch, asked of the person who can supply it. Each
+   ask says what failed and what it would unblock; answering records what they
+   gave, and the next round is where it is used. */
+const NEEDS_LABEL = { processed_table: 'a processed table', sample_sheet: 'a sample sheet',
+  identifier_mapping: 'an identifier mapping', full_text: 'a full text',
+  measurement: 'a measurement', access: 'access', other: 'something else' };
+function renderDataRequests(snap) {
+  const panel = $('#askDataPanel'); if (!panel) return;
+  const dr = snap.data_requests;
+  const items = (dr && dr.items) || [];
+  panel.hidden = !items.length;
+  if (!items.length) return;
+  const h = dr.handover || {};
+  $('#askDataHead').textContent = [h.open ? `${h.open} still open` : null,
+    h.answered ? `${h.answered} answered` : null].filter(Boolean).join(' · ');
+  const host = $('#askDataList'); host.textContent = '';
+  /* One line per request: what is needed and what it would unlock. The
+     reasoning and the answer form are one click away, not five paragraphs
+     each — a run with five requests read as a wall a person had to get
+     through before they could do anything else. Every request is optional:
+     the run did not wait for them, and the next round runs without them. */
+  host.append(el('p', 'dim', 'Each one is optional: the run did not wait for them, and the '
+    + 'next round runs without them. Answer the ones you can; open one for the details.'));
+  const order = { open: 0, answered: 1, declined: 2 };
+  const sorted = items.slice().sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3));
+  sorted.forEach(it => {
+    const box = el('div', 'dreq ' + it.status);
+    const head = el('div', 'dreq-head');
+    head.append(el('span', 'tag', NEEDS_LABEL[it.needs] || it.needs));
+    head.append(el('b', null, clip(it.what, 160)));
+    if (it.accession) head.append(el('span', 'chip', it.accession));
+    if (it.status !== 'open') {
+      head.append(el('span', 'chip', it.status === 'declined' ? 'skipped' : 'answered'));
+    }
+    box.append(head);
+    if (it.unblocks) box.append(el('div', 'dreq-why dim', 'Unlocks: ' + clip(it.unblocks, 180)));
+    const more = el('details', 'dreq-more');
+    more.append(el('summary', null, it.status === 'open' ? 'Details and answer' : 'Details'));
+    appendAll(more, [
+      kv('Why it failed', it.why),
+      kv('What a usable answer looks like', it.shape),
+      kv('It would unblock', it.unblocks),
+      (it.where_to_look || []).length ? kv('Where to look', it.where_to_look.join('; ')) : null,
+    ]);
+    box.append(more);
+    if (it.status === 'open') {
+      more.append(dataAnswerForm(snap.run_id, it));
+    } else {
+      const a = it.answer || {};
+      const done = el('div', 'dreq-answer');
+      done.append(el('b', null, it.status === 'declined' ? 'Cannot be supplied'
+        : 'You provided'));
+      appendAll(done, [
+        a.dataset_id ? kv('Dataset', a.dataset_id) : null,
+        a.url ? kv('Link', a.url) : null,
+        a.note ? kv('In your words', a.note) : null,
+        kv('By', `${a.provided_by} · ${BS.fmt.ago(Date.parse(a.at) / 1000)}`),
+      ]);
+      if (a.note && it.status === 'answered') {
+        done.append(el('p', 'caveat', 'Your words are your report of your own process: the '
+          + 'next round can let them settle a direction, and a number in them enters a '
+          + 'protocol only as an adapted value naming this report, never as a cited one.'));
+      }
+      /* An answer is what the next round uses, so it stays in view; a request
+         that was skipped is a line, with the record of it in the details. */
+      (it.status === 'declined' ? more : box).append(done);
+    }
+    host.append(box);
+  });
+  /* Skipping them is an answer too: the next round is told to stop asking
+     for these, rather than asking again. */
+  const open = items.filter(it => it.status === 'open');
+  if (open.length) {
+    const skip = el('button', 'btn sm', open.length === 1 ? 'Continue without it'
+      : `Continue without these ${open.length}`);
+    skip.title = 'Marks each open request "cannot be supplied", so the next round carries on '
+      + 'without it and does not ask again';
+    skip.addEventListener('click', async () => {
+      if (!confirm(`Mark ${open.length === 1 ? 'this request' : `all ${open.length} open requests`}`
+        + ' as "cannot be supplied"? The next round carries on without them.')) return;
+      skip.disabled = true;
+      try {
+        for (const it of open) {
+          await post(`/api/discovery/${encodeURIComponent(snap.run_id)}/data-request`,
+                     { request_id: it.request_id, decline: true,
+                       note: 'Skipped by the person: carry on without it.' });
+        }
+        const s = await get(`/api/discovery/${encodeURIComponent(snap.run_id)}`);
+        state.run = s; renderDataRequests(s);
+      } catch (e) { fail(e); skip.disabled = false; }
+    });
+    const bar = el('div', 'rv-actions'); bar.append(skip);
+    host.append(bar);
+  }
+  /* Nothing is used until a round reads it: this is the hand-back. */
+  if (h.answered) {
+    const go = el('button', 'btn go', `Start round 2 with what I provided`);
+    go.title = 'A new run seeded with this one\'s files, carrying the datasets and notes you '
+      + 'gave, which reads them against what this run could not settle';
+    go.addEventListener('click', async () => {
+      go.disabled = true;
+      try {
+        await followUpRun(snap.run_id, { results: h.results || undefined,
+                                         dataset_ids: h.dataset_ids || [] });
+      } catch (e) { fail(e); go.disabled = false; }
+    });
+    const act = el('div', 'rv-actions'); act.append(go);
+    host.append(act);
+    host.append(el('p', 'caveat', 'This run stays as it is — a record of what it actually did. '
+      + 'The next round starts from its files plus what you gave.'));
+  }
+}
+function dataAnswerForm(runId, it) {
+  const f = el('form', 'dreq-form');
+  const field = (label, input, hint) => {
+    const l = el('label', null, label); l.append(input); f.append(l);
+    if (hint) f.append(el('p', 'hint', hint));
+    return input;
+  };
+  const ds = field('Dataset id (registered on the Data page)',
+    Object.assign(el('input'), { maxLength: 120, placeholder: 'e.g. my-gse311159-counts' }),
+    'The answer the next round can actually analyse. Register the table on the Data page, '
+    + 'then paste its id here.');
+  const url = field('Or a link', Object.assign(el('input'),
+    { maxLength: 400, placeholder: 'https://…' }));
+  const note = field('Or what you know, in your own words',
+    Object.assign(el('textarea'), { maxLength: 4000, rows: 3 }),
+    'Your report of your own process. It can settle a direction; a number in it enters a '
+    + 'protocol only as an adapted value naming this report.');
+  const go = el('button', 'btn go sm', 'Give this to the run'); go.type = 'submit';
+  const no = el('button', 'btn sm', 'Cannot be supplied'); no.type = 'button';
+  const msg = el('span', 'dim');
+  const row = el('div', 'rv-actions'); row.append(go, no, msg);
+  f.append(row);
+  const send = async body => {
+    go.disabled = no.disabled = true; msg.textContent = 'saving…';
+    try {
+      await post(`/api/discovery/${encodeURIComponent(runId)}/data-request`,
+                 Object.assign({ request_id: it.request_id }, body));
+      const s = await get(`/api/discovery/${encodeURIComponent(runId)}`);
+      state.run = s; renderDataRequests(s);
+    } catch (e) { msg.textContent = e.message; go.disabled = no.disabled = false; }
+  };
+  f.addEventListener('submit', ev => {
+    ev.preventDefault();
+    send({ dataset_id: ds.value.trim(), url: url.value.trim(), note: note.value.trim() });
+  });
+  no.addEventListener('click', () => send({ decline: true, note: note.value.trim() }));
+  return f;
+}
+
+/* Questions to the orchestrator about an ended real run, and its answers.
+   While one is being answered the page re-reads the run every few seconds. */
+let askTimer = null;
+function renderQuestions(snap) {
+  const panel = $('#askPanel'); if (!panel) return;
+  const ended = !RV.isLive(snap) && snap.is_real;
+  panel.hidden = !ended;
+  if (!ended) return;
+  const items = snap.questions || [];
+  const host = $('#askList'); host.textContent = '';
+  items.forEach(q => {
+    const box = el('div', 'ask-item ' + q.status);
+    const qline = el('div', 'ask-q');
+    if (q.kind === 'alternate') qline.append(el('span', 'chip', 'alternate plan'));
+    if (q.kind === 'protocol') qline.append(el('span', 'chip', 'protocol change'));
+    if (q.kind === 'breakthrough') qline.append(el('span', 'chip', 'past the apparatus'));
+    if (q.kind === 'report') qline.append(el('span', 'chip', 'write-up'));
+    qline.append(document.createTextNode(q.question));
+    box.append(qline);
+    box.append(el('div', 'dim ask-who', [q.asked_by, BS.fmt.ago(Date.parse(q.asked_at) / 1000)]
+      .filter(Boolean).join(' · ')));
+    if (q.status === 'answering') {
+      /* With how long it has been at it: "reading its run" for twenty minutes
+         means something is wrong, and a person should not have to guess at
+         what a spinner is doing. */
+      const since = Date.parse(q.asked_at) / 1000;
+      box.append(el('p', 'dim', (q.kind === 'protocol'
+        ? 'The orchestrator is writing the changes… '
+        : q.kind === 'breakthrough'
+        ? 'The orchestrator is designing past the apparatus… '
+        : q.kind === 'report'
+        ? 'The communication agent is writing the run up… '
+        : 'The orchestrator is reading its run and answering… ')
+        + `(${BS.fmt.elapsed(since)} so far; a long answer is a few minutes)`));
+    } else if (q.answer) {
+      const a = el('div', 'ask-a'); mdBlock(q.answer, a); box.append(a);
+    } else {
+      box.append(el('p', 'caveat', 'No answer: ' + (q.error || 'the orchestrator said nothing')));
+    }
+    if (q.wrote && (q.wrote.new || []).length) {
+      box.append(el('p', 'dim', 'Wrote ' + q.wrote.new.join(', ')
+        + ' — under Alternate and extended plans.'));
+    }
+    if (q.kind === 'breakthrough' && q.wrote && q.wrote.breakthrough) {
+      box.append(el('p', 'dim', `Wrote \u201c${q.wrote.breakthrough}\u201d \u2014 under `
+        + 'Beyond the apparatus.'));
+    }
+    if (q.kind === 'report' && q.wrote && q.wrote.communication) {
+      box.append(el('p', 'dim', 'Wrote the narrative (captions for '
+        + q.wrote.communication.join(', ') + '). It is carried by the final report:'));
+      const row = el('div', 'row');
+      row.append(exportLink(snap.run_id, 'pdf', 'Final report (PDF)', '&view=report'),
+        exportLink(snap.run_id, 'docx', 'Final report (Word)', '&view=report'));
+      box.append(row);
+    }
+    if (q.kind === 'protocol' && q.wrote && q.wrote.edits) {
+      const e = q.wrote.edits;
+      const bits = [];
+      if (e.culture_format) bits.push(`laid out for ${e.culture_format.replace('_', ' ')}`
+        + (e.working_volume_ml ? ` at ${e.working_volume_ml} mL` : ''));
+      (e.values || []).forEach(v => bits.push(v));
+      if (e.notes) bits.push(`${e.notes} note${e.notes === 1 ? '' : 's'}`);
+      if ((e.omit || []).length) bits.push('without ' + e.omit.join(', '));
+      box.append(el('p', 'dim', 'Changed the document: ' + (bits.join(' · ') || 'nothing')
+        + '. Export it below (Word or PDF).'));
+      const row = el('div', 'row');
+      row.append(exportLink(snap.run_id, 'docx', 'Word with these changes'),
+        exportLink(snap.run_id, 'pdf', 'PDF with these changes'));
+      box.append(row);
+    }
+    if ((q.files_changed || []).length) {
+      box.append(el('p', 'caveat', (q.kind === 'alternate'
+        ? 'It also changed these, and it was asked to write only the plans: '
+        : q.kind === 'protocol'
+          ? 'It also changed these, and it was asked to write only the protocol edits: '
+          : q.kind === 'breakthrough'
+          ? 'It also changed these, and it was asked to write only the design: '
+          : q.kind === 'report'
+          ? 'It also changed these, and it was asked to write only the narrative: '
+          : 'While answering, these files changed (it was asked not to change anything): ')
+        + q.files_changed.join(', ')));
+    }
+    if (q.session && q.session.fresh) {
+      box.append(el('p', 'dim ask-who', 'Answered by a fresh session reading the run\'s files '
+        + '(the run\'s own session had ended).'));
+    }
+    host.append(box);
+  });
+  const busy = items.some(q => q.status === 'answering');
+  $('#askBtn').disabled = busy;
+  if ($('#altBtn')) $('#altBtn').disabled = busy;
+  if ($('#editBtn')) $('#editBtn').disabled = busy;
+  if ($('#btBtn')) $('#btBtn').disabled = busy;
+  if ($('#repBtn')) $('#repBtn').disabled = busy;
+  clearTimeout(askTimer);
+  if (busy) {
+    askTimer = setTimeout(() => get(`/api/discovery/${snap.run_id}`)
+      .then(s => { state.run = s; renderQuestions(s); }).catch(() => {}), 4000);
+  }
+}
+/* The other leads, worked up as experiments at a person's request: a claim,
+   the arms that would settle it, what it costs to run, and what either outcome
+   means. Beside round 1, never inside it — round 1's rules were fixed before
+   any result existed and its digest records that. */
+const REL_LABEL = { alternate: 'a different way', extension: 'on top of the main plan' };
+const BASIS_LABEL = { cited: 'sources test this', mechanistic: 'mechanism, untested here',
+  judgement: 'the orchestrator\u2019s own reasoning' };
+function renderAlternates(snap) {
+  const panel = $('#altPanel'); if (!panel) return;
+  const a = snap.alternate_plans;
+  const items = (a && a.items) || [];
+  panel.hidden = !items.length;
+  if (!items.length) return;
+  $('#altHead').textContent = `${items.length} proposed · beside round 1, not in it`;
+  const host = $('#altList'); host.textContent = '';
+  host.append(el('p', 'dim', 'Asked for: \u201c' + (a.request || '') + '\u201d'));
+  items.forEach(it => {
+    const box = el('div', 'alt-item');
+    const head = el('div', 'ev-row');
+    head.append(el('span', 'chip', it.alt_id));
+    head.append(el('span', 'chip', REL_LABEL[it.relation] || it.relation));
+    head.append(miniBar(it.confidence));
+    head.append(el('span', 'dim', `${it.confidence} · ${BASIS_LABEL[it.evidence_basis]
+      || it.evidence_basis}`));
+    (it.refs || []).slice(0, 3).forEach(r => head.append(el('span', 'ref', r)));
+    box.append(head);
+    box.append(el('h4', null, it.title));
+    box.append(el('p', null, it.claim));
+    box.append(appendAll(el('div'), [
+      kv('Why it is worth a vessel', it.rationale),
+      kv('How it differs from the main plan', it.differs_from_main),
+      kv('What it costs', it.cost),
+      it.would_change ? kv('What it would change', it.would_change) : null,
+    ]));
+    const t = el('table', 'rp-arms');
+    const hr = el('tr');
+    ['Arm', 'What differs', 'Basis'].forEach(x => hr.append(el('th', null, x)));
+    t.append(hr);
+    (it.arms || []).forEach(arm => {
+      const tr = el('tr');
+      const sp = Object.entries(arm.setpoints || {}).map(([k, v]) => `${k} ${v}`).join(', ');
+      const what = el('span');
+      what.append(document.createTextNode(arm.label));
+      if (arm.on_top_of) what.append(el('span', 'dim', ` · on top of ${arm.on_top_of}`));
+      if (sp) what.append(el('div', 'dim mono', sp));
+      [el('span', null, arm.arm_id), what, el('span', 'dim', arm.basis || '—')]
+        .forEach(c => { const td = el('td'); td.append(c); tr.append(td); });
+      t.append(tr);
+    });
+    box.append(t);
+    box.append(el('div', 'lab', 'Measure'));
+    (it.readouts || []).forEach(r => box.append(el('div', 'chip', [r.name, r.unit, r.when]
+      .filter(Boolean).join(' · '))));
+    box.append(el('p', 'rec-test', `If ${it.decision_rule.if} → ${it.decision_rule.then}`));
+    host.append(box);
+  });
+  (a.not_pursued || []).forEach(x => {
+    host.append(el('p', 'caveat', `Asked for, not worked up — ${x.what}: ${x.why}`));
+  });
+  host.append(el('p', 'caveat', a.does_not_change));
+  host.append(el('p', 'caveat', a.note));
+}
+
+/* The experiment past the apparatus: what it lifts, what it keeps, the stages
+   in the new apparatus, the arms and a judgement range. A concept beside
+   round 1 — never runnable here, never approved, the aim never relaxed. */
+function btCondition(c) {
+  if (c.provenance === 'gap') {
+    return el('div', 'bt-cond gap', `${c.factor}: GAP \u2014 ${c.what_would_settle || ''}`);
+  }
+  const d = el('div', 'bt-cond');
+  d.append(document.createTextNode(`${c.factor} `));
+  d.append(el('b', null, `${c.value}${c.unit ? ' ' + c.unit : ''}`));
+  d.append(el('span', 'dim', ` [${PROV_LETTER[c.provenance] || c.provenance}]`
+    + ((c.refs || []).length ? ' ' + c.refs.join(', ') : '')));
+  if (c.rationale) d.title = c.rationale;
+  return d;
+}
+function renderBreakthrough(snap) {
+  const panel = $('#btPanel'); if (!panel) return;
+  const bt = snap.breakthrough_design;
+  panel.hidden = !bt;
+  if (!bt) return;
+  renderSectionExports(snap);   // idempotent; a run with no insights never reaches it
+  $('#btHead').textContent = 'a concept beside round 1 \u00b7 not runnable here, not approved';
+  const host = $('#btBody'); host.textContent = '';
+  const head = el('div', 'ev-row');
+  head.append(el('span', 'chip', 'CONCEPT'));
+  head.append(miniBar(bt.confidence));
+  head.append(el('span', 'dim', `${bt.confidence} \u00b7 ${BASIS_LABEL[bt.evidence_basis]
+    || bt.evidence_basis}`));
+  (bt.refs || []).slice(0, 4).forEach(r => head.append(el('span', 'ref', r)));
+  host.append(head);
+  host.append(el('h4', null, bt.title));
+  host.append(appendAll(el('div'), [
+    kv('Aim', bt.aim), kv('Why this, now', bt.why_now),
+    kv('Why it gets closer', bt.closest_to_aim), kv('What it still leaves', bt.gap_to_aim),
+  ]));
+
+  host.append(el('div', 'lab', 'What it lifts'));
+  const lift = el('div', 'bt-lift');
+  bt.constraints_lifted.forEach(c => {
+    const row = el('div', 'bt-lift-row');
+    const now = el('div', 'bt-now');
+    now.append(el('div', 'bt-k', c.constraint), el('div', 'dim', c.now));
+    const to = el('div', 'bt-to');
+    to.append(el('div', 'bt-k', c.kind.replace(/_/g, ' ')), el('div', null, c.lifted_to));
+    row.append(now, el('div', 'bt-arrow', '\u2192'), to);
+    const why = el('div', 'dim bt-why', 'Why it stands in the way: ' + c.why_it_limits
+      + ` (${c.evidence_basis}${(c.refs || []).length ? '; ' + c.refs.join(', ') : ''})`);
+    lift.append(row, why);
+  });
+  host.append(lift);
+  host.append(el('p', 'dim', 'Kept: ' + bt.kept.map(k => k.what).join(' \u00b7 ')));
+
+  const a = bt.apparatus;
+  host.append(el('div', 'lab', 'The apparatus'));
+  host.append(el('p', null, `${a.name} (${a.exists.replace(/_/g, ' ')}). ${a.description}`));
+  if ((a.features || []).length) {
+    const f = el('div', 'row');
+    a.features.forEach(x => f.append(el('span', 'chip', x)));
+    host.append(f);
+  }
+
+  host.append(el('div', 'lab', 'The stages in the new apparatus'));
+  const lo = Math.min(...bt.stages.map(x => x.day_start));
+  const hi = Math.max(...bt.stages.map(x => x.day_end));
+  const band = el('div', 'bt-band');
+  const cards = el('div', 'bt-stages');
+  bt.stages.forEach((st, i) => {
+    const seg = el('div', 'bt-seg s' + (i % 7), st.label);
+    seg.style.flexGrow = String(Math.max(st.day_end - st.day_start, 0.5));
+    seg.title = `${st.label}: day ${st.day_start}\u2013${st.day_end}`;
+    band.append(seg);
+    const card = el('div', 'bt-stage');
+    card.append(el('div', 'bt-k', st.label),
+      el('div', 'dim', `day ${st.day_start}\u2013${st.day_end}`));
+    (st.conditions || []).forEach(c => card.append(btCondition(c)));
+    if (!(st.conditions || []).length) card.append(el('div', 'dim', 'no factor set'));
+    if (st.note) card.append(el('div', 'dim', st.note));
+    cards.append(card);
+  });
+  host.append(band, el('div', 'dim bt-axis', `day ${lo} \u2192 day ${hi}`), cards);
+
+  host.append(el('div', 'lab', 'The arms'));
+  const t = el('table', 'rp-arms');
+  const hr = el('tr');
+  ['Arm', 'What it is', 'What differs'].forEach(x => hr.append(el('th', null, x)));
+  t.append(hr);
+  bt.arms.forEach(arm => {
+    const tr = el('tr');
+    [arm.arm_id + (arm.control ? ' \u00b7 control' : ''), arm.label, arm.differs]
+      .forEach(x => tr.append(el('td', null, x)));
+    t.append(tr);
+  });
+  host.append(t);
+  host.append(el('div', 'lab', 'Measure'));
+  bt.readouts.forEach(r => host.append(el('div', 'chip', [r.name, r.unit, r.when]
+    .filter(Boolean).join(' \u00b7 '))));
+  if (bt.replicates) host.append(el('p', 'dim', `${bt.replicates} replicate(s) per arm.`));
+  host.append(el('p', 'rec-test', `If ${bt.decision_rule.if} \u2192 ${bt.decision_rule.then}`));
+
+  const x = bt.expected;
+  if (x) {
+    host.append(el('div', 'lab', 'What it might do \u2014 a judgement, not a prediction'));
+    const unit = x.change_unit === 'percentage_points' ? 'percentage points' : (x.change_unit || '');
+    host.append(el('p', null, `${x.metric}: ${x.interval.lower} to ${x.interval.upper} ${unit} `
+      + `over the control, ${x.judgement.confidence} confidence. ${x.judgement.rationale}`));
+  }
+  const f = bt.feasibility;
+  host.append(appendAll(el('div'), [
+    kv('What it takes', [f.cost, f.time, f.expertise].filter(Boolean).join(' \u00b7 ')),
+    kv('Build steps', (f.build_steps || []).join(' \u2192 ')),
+    kv('Risks', bt.risks.map(r => `${r.risk} \u2014 ${r.mitigation}`).join('; ')),
+  ]));
+  host.append(el('p', 'caveat', bt.does_not_change));
+}
+
+async function askQuestion(ev, kind) {
+  if (ev) ev.preventDefault();
+  const snap = state.run;
+  let text = $('#askText').value.trim();
+  if (kind === 'breakthrough' && text.length < 3) {
+    text = 'Design the experiment past the apparatus that gets closest to the aim.';
+  }
+  if (kind === 'report' && text.length < 3) {
+    text = 'Write the run up for reading: an executive summary and what each stage looks '
+      + 'like at the bench.';
+  }
+  if (!snap || text.length < 3) {
+    if (kind === 'alternate') {
+      $('#askMsg').textContent = 'Say which of the run\u2019s leads to work up.';
+    } else if (kind === 'protocol') {
+      $('#askMsg').textContent = 'Say what to change: the vessel, a value, a note, a section to leave out.';
+    }
+    return;
+  }
+  $('#askBtn').disabled = true;
+  if ($('#altBtn')) $('#altBtn').disabled = true;
+  if ($('#editBtn')) $('#editBtn').disabled = true;
+  if ($('#btBtn')) $('#btBtn').disabled = true;
+  if ($('#repBtn')) $('#repBtn').disabled = true;
+  $('#askMsg').textContent = '';
+  try {
+    await post(`/api/discovery/${snap.run_id}/ask`,
+      { question: text, kind: kind || 'question' });
+    $('#askText').value = '';
+    const s = await get(`/api/discovery/${snap.run_id}`); state.run = s; renderQuestions(s);
+  } catch (e) {
+    $('#askMsg').textContent = e.message || String(e);
+    $('#askBtn').disabled = false;
+    if ($('#altBtn')) $('#altBtn').disabled = false;
+    if ($('#editBtn')) $('#editBtn').disabled = false;
+    if ($('#btBtn')) $('#btBtn').disabled = false;
+    if ($('#repBtn')) $('#repBtn').disabled = false;
+  }
+}
+
+/* Every hypothesis but the recommended one, one line each; a row opens on its
+   full statement and the reason it is, or is not, in the protocol. */
+function renderOtherHypotheses(p, selected) {
+  const panel = $('#otherPanel'), host = $('#otherHyps');
+  if (!panel || !host) return;
+  host.textContent = '';
+  const rows = ((p || {}).hypothesis_ledger || [])
+    .filter(r => !selected || r.hypothesis_id !== selected.hypothesis_id);
+  panel.hidden = !rows.length;
+  if (!rows.length) return;
+  const actions = (p || {}).actions || {};
+  host.append(foldTable(['Hypothesis', 'Status', 'In the plan', 'Confidence'], rows.map(r => {
+    const name = el('span');
+    name.append(el('b', null, r.hypothesis_id + ' '), actions[r.hypothesis_id] || clip(r.statement, 120));
+    const st = term('hypothesis_status', r.status, null, 'st');
+    return {
+      key: 'other:' + r.hypothesis_id,
+      cells: [name, st, r.adopted ? 'yes' : 'no', r.confidence || '—'],
+      detail: appendAll(el('div'), [kv('Statement', r.statement), kv('Why', r.reason),
+        kv('Evidence', (r.evidence_sources || []).join(', ').replace(/_/g, ' '))]),
+    };
+  }), 'other'));
+}
+
+function renderCandidates(rows) {
+  const host = $('#candidates'); if (!host) return;
+  host.textContent = '';
+  if (!rows.length) { host.append(el('p', 'dim', 'No candidate parameter was produced.')); return; }
+  rows.forEach(c => {
+    const w = el('div', 'ds');
+    const t = el('div', 't');
+    t.append(document.createTextNode(c.label || c.parameter_id));
+    t.append(document.createTextNode('  '));
+    t.append(term('simulator_coverage', c.simulator_coverage, null, 'ev'));
+    w.append(t);
+    const m = el('div', 'm');
+    m.textContent = [
+      c.current_value != null ? `current ${c.current_value}` : null,
+      c.candidate_value != null ? `candidate ${c.candidate_value}` : null,
+      c.unit, c.direction, c.confidence ? `confidence ${c.confidence}` : null,
+      c.suggested_range ? `range ${c.suggested_range.minimum}–${c.suggested_range.maximum}`
+        : null,
+    ].filter(Boolean).join(' · ');
+    w.append(m);
+    if (c.reason) w.append(Object.assign(el('div', 'dim'),
+      { style: 'font-size:12.5px;margin-top:4px', textContent: c.reason }));
+    if (c.modelled) {
+      const b = el('button', 'btn', 'Open in simulator');
+      b.addEventListener('click', () => openInSimulator(c));
+      w.append(b);
+    } else {
+      w.append(el('p', 'caveat',
+        'Not modelled here, so no effect is predicted for it. It is still a real design '
+        + 'variable you can set in the lab.'));
+    }
+    host.append(w);
+  });
+}
+
+/* The handoff: the simulator opens on this project with the control and the
+   candidate already loaded, so nobody retypes a setpoint. */
+function openInSimulator(c) {
+  const payload = {
+    project_id: (state.result && state.result.bundle.project_id) || $('#project').value,
+    parameter_id: c.parameter_id, label: c.label, unit: c.unit,
+    control: c.current_value, candidate: c.candidate_value,
+    reason: c.reason, confidence: c.confidence,
+    evidence_sources: c.evidence_sources || [],
+    from_run: state.run && state.run.run_id,
+  };
+  try { localStorage.setItem('bs-sim-candidate', JSON.stringify(payload)); } catch (_) {}
+  location.href = 'simulator.html';
+}
+
+/* The whole derived protocol, every setpoint with its provenance, handed to
+   the Simulator — so a scientist can see what the estimate would do in the
+   most realistic reactor model there is, labelled for what that model is. */
+function simulateProtocol(p) {
+  const values = [];
+  (p.stages || []).forEach(s => (s.parameters || []).forEach(q => {
+    if (q.recommended_value == null || typeof q.recommended_value !== 'number') return;
+    values.push({ parameter_id: q.parameter_id, label: q.label, unit: q.unit,
+      value: q.recommended_value, provenance: q.provenance, stage: s.stage_id });
+  }));
+  const proj = p.project || {};
+  const payload = {
+    kind: 'protocol', project_id: proj.project_id, project_name: proj.name,
+    has_simulator: !!(proj.simulator && proj.simulator !== 'none'
+      && (proj.simulator.model_id || proj.simulator.status !== 'none')),
+    values, gaps: (p.gaps || []).map(g => g.parameter_id),
+    from_run: state.run && state.run.run_id, title: p.title,
+  };
+  try { localStorage.setItem('bs-sim-candidate', JSON.stringify(payload)); } catch (_) {}
+  location.href = 'simulator.html';
+}
+
+/* ── The protocol as a production chain ────────────────────────
+   Stages are columns sized by their days; a factor is a bar over the stage it
+   is given in; setpoints sit in their stage, and whole-process setpoints run
+   the full width. Every value carries its provenance letter and a three-step
+   confidence bar, and a click shows what it rests on. A lever a hypothesis
+   named that the project does not have is a dashed row: seen, never mistaken
+   for a protocol value. */
+const PROV_LETTER = { reported: 'R', adapted: 'A', design_choice: 'D', gap: 'GAP' };
+const MOLAR = ['pM', 'nM', 'uM', 'µM', 'mM'];
+function isFactor(q) {
+  const u = (q.unit || '').trim();
+  return MOLAR.includes(u) || (/\/(ml|l)$/i.test(u) && !/cell/i.test(u));
+}
+function valueConfidence(q, ledger) {
+  if (q.provenance === 'gap') return { level: null, text: 'no value' };
+  if (q.design_choice) return { level: q.design_choice.confidence, text: q.design_choice.confidence };
+  if (q.hypothesis_ref) {
+    const c = ledger[q.hypothesis_ref];
+    return { level: c || null, text: c || 'unstated' };
+  }
+  return { level: null, text: 'in use' };
+}
+function miniBar(level) {
+  const bar = el('span', 'confbar mini ' + (level || 'none'));
+  for (let i = 1; i <= 3; i++) bar.append(el('span', level && i <= (CONF_LEVELS[level] || 0) ? 'on' : ''));
+  return bar;
+}
+function renderTimeline(p) {
+  const tl = p.timeline;
+  const ledger = {};
+  (p.hypothesis_ledger || []).forEach(r => { ledger[r.hypothesis_id] = r.confidence; });
+  const byStage = {};
+  (p.stages || []).forEach(s => { byStage[s.stage_id] = s.parameters; });
+  const wrap = el('div', 'ptl');
+  wrap.append(el('div', 'lab', 'Production timeline'));
+  wrap.append(el('p', 'caveat', `${tl.total_days} days from seeding to harvest at the project's `
+    + 'stage lengths. R reported · A adapted · D design choice · GAP no value. The bar is how sure '
+    + 'the value is; "in use" is the setting the process already runs at. Click a value for its basis.'));
+  const scroll = el('div', 'ptl-scroll');
+  const grid = el('div', 'ptl-grid');
+  /* Widths follow the days, with a floor so a one-day stage stays readable;
+     below the sum of the floors the chain scrolls inside its own box. */
+  const floors = tl.stages.map(s => Math.max(130, 9 * (s.days || 1)));
+  grid.style.gridTemplateColumns = tl.stages.map((s, i) =>
+    `minmax(${floors[i]}px, ${s.days || 1}fr)`).join(' ');
+  grid.style.minWidth = (floors.reduce((a, b) => a + b, 0) + 8 * (floors.length - 1)) + 'px';
+  const basis = el('div', 'ptl-basis'); basis.hidden = true;
+  basis.dataset.project = (p.project || {}).project_id || '';
+  let picked = null;
+
+  const chip = (q, cls) => {
+    const c = valueConfidence(q, ledger);
+    const b = el('button', 'ptl-val ' + (cls || '') + ' prov-' + q.provenance);
+    b.type = 'button';
+    b.append(el('span', 'nm', q.label));
+    b.append(el('span', 'v', q.provenance === 'gap' ? '—'
+      : num(q.recommended_value) + (q.unit ? ' ' + q.unit : '')));
+    if (q.changed) b.append(el('span', 'was', `was ${num(q.control_value)}`));
+    const meta = el('span', 'meta');
+    meta.append(el('span', 'pl ' + q.provenance, PROV_LETTER[q.provenance] || '?'), miniBar(c.level),
+      el('span', 'ct', c.text));
+    b.append(meta);
+    b.addEventListener('click', () => {
+      if (picked) picked.classList.remove('on');
+      if (picked === b) { picked = null; basis.hidden = true; return; }
+      picked = b; b.classList.add('on'); showBasis(basis, q, c, ledger);
+    });
+    return b;
+  };
+
+  tl.stages.forEach((s, i) => {
+    const h = el('div', 'ptl-head');
+    h.style.gridColumn = String(i + 1);
+    h.append(el('strong', null, s.label));
+    h.append(el('span', 'days', s.days == null ? 'days not set'
+      : `d${num(s.day_start)}–${num(s.day_start + s.days)} · ${num(s.days)} d`));
+    if (s.goal) h.append(el('span', 'goal', s.goal));
+    grid.append(h);
+  });
+  const lane = (name) => {
+    const l = el('div', 'ptl-lane', name);
+    l.style.gridColumn = `1 / ${tl.stages.length + 1}`;
+    grid.append(l);
+  };
+  const factors = [], setpoints = [];
+  tl.stages.forEach((s, i) => (byStage[s.stage_id] || []).forEach(q =>
+    (isFactor(q) ? factors : setpoints).push([i, q])));
+  /* One cell per stage, so each factor's bar spans exactly its stage's days. */
+  const cells = (rows, cls) => tl.stages.forEach((s, i) => {
+    const cell = el('div', 'ptl-cell');
+    cell.style.gridColumn = String(i + 1);
+    rows.filter(([j]) => j === i).forEach(([, q]) => cell.append(chip(q, cls)));
+    grid.append(cell);
+  });
+  if (factors.length) { lane('Factors — each bar is the window it is given in'); cells(factors, 'fbar'); }
+  if (setpoints.length) { lane('Stage setpoints'); cells(setpoints); }
+  const whole = byStage.all || [];
+  if (whole.length) {
+    lane('Whole process');
+    whole.forEach(q => {
+      const c = chip(q, 'fbar whole');
+      c.style.gridColumn = `1 / ${tl.stages.length + 1}`;
+      grid.append(c);
+    });
+  }
+  if ((tl.candidates || []).length) {
+    lane('Named by a hypothesis, not yet a parameter of this project');
+    tl.candidates.forEach(cand => {
+      const i = tl.stages.findIndex(s => s.stage_id === cand.stage_id);
+      const b = el('div', 'ptl-val fbar cand');
+      b.style.gridColumn = i >= 0 ? String(i + 1) : `1 / ${tl.stages.length + 1}`;
+      b.append(el('span', 'nm', cand.label));
+      b.append(el('span', 'v', cand.candidate_value != null
+        ? num(cand.candidate_value) + (cand.unit ? ' ' + cand.unit : '')
+        : (cand.direction || 'direction only')));
+      const meta = el('span', 'meta');
+      meta.append(el('span', 'pl cand', 'NEW'), miniBar(cand.confidence),
+        el('span', 'ct', cand.confidence || ''));
+      b.append(meta);
+      b.title = (cand.statement || '') + ' — not in the protocol until it is registered.';
+      const reg = el('button', 'btn sm', 'Register in my project');
+      reg.type = 'button';
+      reg.addEventListener('click', () => {
+        const f = b.querySelector('.regform');
+        if (f) { f.remove(); return; }
+        b.append(registerForm(p, cand, tl.stages));
+      });
+      b.append(reg);
+      grid.append(b);
+    });
+  }
+  scroll.append(grid);
+  wrap.append(scroll, basis);
+  return wrap;
+}
+/* How a parameter acts, stated by a person so the reactor can play it: a shape,
+   what it acts on, its constant(s), a bounded size and the reason. Stored on the
+   project as EXPERT-DECLARED — a stated response, never a fitted one. */
+function effectFields(holder, hint) {
+  const box = el('fieldset', 'effbox');
+  box.append(el('legend', null, 'Model its effect (optional) — so the Simulator can play it'));
+  const f = (label, input) => { const l = el('label', null, label); l.append(input); box.append(l); return input; };
+  const shape = f('Shape', el('select'));
+  [['saturating', 'rises to a plateau'], ['bell', 'has an optimum'], ['threshold', 'switches on above a level'],
+   ['linear', 'proportional']].forEach(([v, l]) => { const o = el('option', null, l); o.value = v; shape.append(o); });
+  const target = f('Acts on', el('select'));
+  [['transition_efficiency', 'differentiation'], ['growth', 'growth'], ['harvest', 'harvest'],
+   ['viability', 'viability (not playable in the reactor)']].forEach(([v, l]) => {
+    const o = el('option', null, l); o.value = v; target.append(o); });
+  const k1 = f('Half-maximal value', Object.assign(el('input'), { type: 'number', step: 'any', placeholder: hint || '' }));
+  const k2 = f('Tolerance (±)', Object.assign(el('input'), { type: 'number', step: 'any' }));
+  k2.parentElement.hidden = true;
+  const eff = f('At best, changes it by (%)', Object.assign(el('input'), { type: 'number', step: 'any', value: '20' }));
+  const basis = f('Why this shape and size', Object.assign(el('input'), { maxLength: 400,
+    placeholder: 'e.g. two papers show a dose-dependent rise that plateaus near 1 uM' }));
+  basis.parentElement.style.gridColumn = '1/-1';
+  const names = { saturating: 'Half-maximal value', bell: 'Optimum', threshold: 'Threshold', linear: 'Slope per unit' };
+  shape.addEventListener('change', () => {
+    k1.parentElement.firstChild.textContent = names[shape.value];
+    k2.parentElement.hidden = shape.value !== 'bell';
+  });
+  holder.append(box);
+  return () => {
+    if (k1.value === '' && !basis.value.trim()) return null;      // left empty: not modelled
+    const rm = { shape: shape.value, target: target.value, max_effect: (+eff.value || 0) / 100,
+      basis: basis.value.trim(), origin: 'expert_declared', calibrated: false };
+    const key = { saturating: 'half_max', bell: 'optimum', threshold: 'threshold', linear: 'slope' }[shape.value];
+    rm[key] = +k1.value;
+    if (shape.value === 'bell') rm.tolerance = +k2.value;
+    return rm;
+  };
+}
+
+/* A lever a hypothesis named becomes a parameter of the person's own project:
+   a unit, the range a hypothesis may propose within, and the stage it is given
+   in. No value is set here — the hypothesis supplies it, or the row stays a gap. */
+function registerForm(p, cand, stages) {
+  const f = el('form', 'regform');
+  const field = (label, input) => { const l = el('label', null, label); l.append(input); f.append(l); return input; };
+  /* With no candidate behind it the person names the lever themselves, so the
+     same form adds what the run proposed and what they know it needs. */
+  const name = cand.label ? null : field('Name', Object.assign(el('input'),
+    { required: true, maxLength: 120, placeholder: 'e.g. M-CSF' }));
+  const unit = field('Unit', Object.assign(el('input'), { value: cand.unit || '', required: true,
+    maxLength: 30, placeholder: 'ng/mL' }));
+  const stage = field('Given during', el('select'));
+  [['all', 'the whole process']].concat(stages.map(s => [s.stage_id, s.label])).forEach(([v, l]) => {
+    const o = el('option', null, l); o.value = v; if (v === (cand.stage_id || 'all')) o.selected = true;
+    stage.append(o);
+  });
+  const lo = field('Lowest a hypothesis may propose', Object.assign(el('input'),
+    { type: 'number', step: 'any', value: '0', required: true }));
+  const hi = field('Highest', Object.assign(el('input'), { type: 'number', step: 'any', required: true }));
+  if (cand.candidate_value != null) hi.value = String(Math.max(cand.candidate_value * 4, 1));
+  const why = field('Where the range comes from (optional)', Object.assign(el('input'),
+    { maxLength: 300, placeholder: 'e.g. doses used in the cited papers' }));
+  const model = effectFields(f, cand.candidate_value != null ? String(cand.candidate_value) : '');
+  const go = el('button', 'btn go sm', 'Add to my project'); go.type = 'submit';
+  const msg = el('p', 'dim');
+  f.append(go, msg);
+  f.addEventListener('submit', async ev => {
+    ev.preventDefault(); go.disabled = true; msg.textContent = 'adding…';
+    try {
+      const runId = state.run && state.run.run_id;
+      const d = await post(`/api/projects/${encodeURIComponent(p.project.project_id)}/parameters`, {
+        label: cand.label || (name && name.value.trim()),
+        parameter_id: cand.parameter_id, hypothesis_id: cand.hypothesis_id,
+        unit: unit.value.trim(), stage: stage.value, minimum: +lo.value, maximum: +hi.value,
+        bound_basis: why.value.trim(), meaning: cand.statement || null, run_id: runId,
+        response_model: model(),
+      });
+      msg.textContent = d.note + (d.protocol_rebuilt ? ' The protocol below was rebuilt.'
+        : d.rebuild_note ? ' ' + d.rebuild_note + '.' : '');
+      if (d.protocol_rebuilt && runId) setTimeout(() => watchRun(runId), 600);
+      loadProjects().catch(() => {});
+    } catch (e) { msg.textContent = e.message; go.disabled = false; }
+  });
+  return f;
+}
+
+function showBasis(box, q, c, ledger) {
+  box.hidden = false; box.textContent = '';
+  box.append(el('h4', null, `${q.label}: ${q.provenance === 'gap' ? 'no value'
+    : num(q.recommended_value) + (q.unit ? ' ' + q.unit : '')}`));
+  const tags = el('div', 'tags');
+  tags.append(term('provenance', q.provenance, null, 'tag ' + q.provenance));
+  if (q.estimate_type) tags.append(term('estimate_type', q.estimate_type, null, 'tag'));
+  tags.append(term('simulator_coverage', q.simulator_coverage, null, 'tag ' + q.simulator_coverage));
+  const conf = el('span', 'confline');
+  conf.append(miniBar(c.level), ' ', c.text === 'in use' ? 'the value the process already uses'
+    : c.text === 'no value' ? 'nothing sets it yet' : c.text + ' confidence');
+  tags.append(conf);
+  box.append(tags);
+  const dl = el('dl', 'kv');
+  const add = (k, v) => { if (v == null || v === '' || (Array.isArray(v) && !v.length)) return;
+    dl.append(el('dt', null, k), el('dd', null, Array.isArray(v) ? v.join('; ') : String(v))); };
+  if (q.changed) add('Changed from', num(q.control_value) + (q.unit ? ' ' + q.unit : ''));
+  add('Why', q.reason);
+  if (q.hypothesis_ref) add('Hypothesis', q.hypothesis_ref);
+  add('Evidence', q.evidence_sources);
+  const dc = q.design_choice;
+  if (dc) {
+    add('Derived from', dc.derived_from);
+    add('Reference entry', dc.reference_entry);
+    add('Context', dc.context_note);
+    add('Would settle it', dc.would_settle_it);
+    add('Risk if wrong', dc.risk_if_wrong);
+  }
+  if (!q.hypothesis_ref && !dc && q.provenance !== 'gap')
+    add('Basis', 'The value this process already runs at (the project profile). Nothing in this run proposed changing it.');
+  if (q.suggested_range) add('Allowed range', `${num(q.suggested_range.minimum)} – ${num(q.suggested_range.maximum)}`);
+  if (q.constraint) add('Range set by', `${q.constraint.source}${q.constraint.basis ? ': ' + q.constraint.basis : ''}`);
+  if (q.provenance === 'gap') add('Blocks the wet lab', 'Needs evidence or a named design choice before a run.');
+  box.append(dl);
+  if (['not_modelled', 'no_simulator'].includes(q.simulator_coverage) && box.dataset.project) {
+    const open = el('button', 'btn sm', 'Give it a modelled effect');
+    open.type = 'button';
+    box.append(open);
+    open.addEventListener('click', () => {
+      open.remove();
+      const form = el('form', 'regform');
+      const read = effectFields(form, q.recommended_value != null ? String(q.recommended_value) : '');
+      const go = el('button', 'btn go sm', 'Save the effect'); go.type = 'submit';
+      const msg = el('p', 'dim'); form.append(go, msg); box.append(form);
+      form.addEventListener('submit', async ev => {
+        ev.preventDefault(); go.disabled = true;
+        try {
+          const rm = read();
+          if (!rm) throw new Error('state the constant and why');
+          const d = await post(`/api/projects/${encodeURIComponent(box.dataset.project)}/parameters/`
+            + `${encodeURIComponent(q.parameter_id)}/model`, { response_model: rm });
+          msg.textContent = `${d.description.summary} — ${d.note}`;
+        } catch (e) { msg.textContent = e.message; go.disabled = false; }
+      });
+    });
+  }
+}
+
+function renderProtocol(p) {
+  const host = $('#protocol'); if (!host) return;
+  host.textContent = '';
+  $('#protocolPanel').hidden = false;
+  const sim = el('button', 'btn go', 'Simulate this protocol');
+  sim.title = 'Open the Simulator with every recommended setpoint as the candidate';
+  sim.addEventListener('click', () => simulateProtocol(p));
+  const fs = el('button', 'btn sm', 'Widen');
+  fs.type = 'button';
+  fs.title = 'Give the plan the full width of the page; everything else stays, below it';
+  fs.addEventListener('click', () => toggleFocus());
+  host.append(el('div', 'rv-actions', null));
+  host.lastChild.append(sim, fs);
+
+  const head = el('div', 'ev-row');
+  head.append(el('span', 'rt-badge ' + p.runtime_mode, p.badge));
+  head.append(el('span', 'flag', 'PROPOSED — NOT APPROVED'));
+  host.append(head);
+  host.append(el('p', 'caveat', p.approval.how));
+  if (p.blocks_wet_lab) {
+    const s = el('div', 'state');
+    s.append(el('h4', null, 'This protocol has gaps and cannot be run'));
+    s.append(el('p', null, 'Each gap needs evidence or a named design choice before a wet-lab '
+      + 'run. They are listed below.'));
+    host.append(s);
+  }
+
+  const c = p.summary_counts;
+  host.append(Object.assign(el('p', 'mut'), { style: 'margin:12px 0',
+    textContent: `${c.parameters_changed} of ${c.parameters_total} parameters change. `
+      + `${c.hypotheses_adopted} of ${c.hypotheses_total} hypotheses are in the protocol; `
+      + `${c.hypotheses_discarded} are not.` }));
+
+  if (p.first_pass && (p.first_pass.stages || []).length) {
+    host.append(renderFlow(p.first_pass));
+    host.append(renderPlan(p.first_pass, p));
+  }
+  if (p.timeline && (p.timeline.stages || []).length) {
+    const tlBox = el('details', 'proto-rows');
+    tlBox.append(el('summary', null, 'Production timeline — every value with its basis'));
+    tlBox.append(renderTimeline(p));
+    host.append(tlBox);
+  }
+  const rowsBox = el('details', 'proto-rows');
+  rowsBox.append(el('summary', null, 'Every value, row by row'));
+  host.append(rowsBox);
+  p.stages.forEach(st => {
+    const w = el('div', 'proto-stage');
+    w.append(el('h4', null, st.label));
+    if (st.goal) w.append(el('p', 'goal', st.goal));
+    st.parameters.forEach(q => {
+      const row = el('div', 'prow' + (q.changed ? ' changed' : ''));
+      row.append(el('div', 'nm', q.label + (q.unit ? ` (${q.unit})` : '')));
+      const vals = el('div', 'vals');
+      if (q.changed) {
+        vals.append(document.createTextNode(num(q.control_value) + ' → '));
+        vals.append(el('span', 'to', num(q.recommended_value)));
+      } else {
+        vals.append(document.createTextNode(num(q.recommended_value)));
+      }
+      row.append(vals);
+      const tags = el('div', 'tags');
+      tags.append(term('provenance', q.provenance, null, 'tag ' + q.provenance));
+      if (q.estimate_type) tags.append(term('estimate_type', q.estimate_type, null, 'tag'));
+      tags.append(term('simulator_coverage', q.simulator_coverage, null,
+        'tag ' + q.simulator_coverage));
+      row.append(tags);
+      w.append(row);
+      if (q.reason && q.changed) {
+        w.append(Object.assign(el('div', 'dim'),
+          { style: 'font-size:12.5px;padding:0 0 6px', textContent: q.reason }));
+      }
+      /* A reasoned starting value shows its basis and how sure it is, so it
+         reads as a proposal to approve — never as a measured setting. */
+      if (q.design_choice) {
+        const dc = q.design_choice;
+        const box = Object.assign(el('div', 'dim'), { style: 'font-size:12.5px;padding:0 0 6px' });
+        box.append(el('span', 'conf ' + dc.confidence, dc.confidence + ' confidence'), ' ');
+        box.append(document.createTextNode(q.reason || ''));
+        box.append(el('div', null, 'Derived from: ' + (dc.derived_from || []).join('; ')));
+        if (dc.would_settle_it) box.append(el('div', null, 'Would settle it: ' + dc.would_settle_it));
+        w.append(box);
+      }
+    });
+    rowsBox.append(w);
+  });
+
+  if ((p.gaps || []).length) {
+    host.append(el('div', 'lab', 'Gaps — these block the wet lab'));
+    const ul = el('ul', 'tight');
+    p.gaps.forEach(g => ul.append(el('li', null, `${g.parameter_id}: ${g.why}`)));
+    host.append(ul);
+  }
+  /* Grouped by what the reader can do about them, restatements folded. The
+     first two groups are open; what the machine lacks and the standing rules
+     are one click away, because they are true of every run. */
+  const groups = p.limitation_groups || [];
+  if (groups.length) {
+    host.append(el('div', 'lab', 'Limitations'));
+    groups.forEach(g => {
+      const det = el('details');
+      if (g.kind === 'blocks' || g.kind === 'unsettled') det.open = true;
+      det.append(el('summary', null, `${g.label} (${g.items.length})`));
+      const ul = el('ul', 'tight');
+      g.items.forEach(x => ul.append(el('li', null, x)));
+      det.append(ul); host.append(det);
+    });
+  } else if ((p.limitations || []).length) {
+    const det = el('details');
+    det.append(el('summary', null, 'Limitations'));
+    const ul = el('ul', 'tight');
+    p.limitations.forEach(x => ul.append(el('li', null, x)));
+    det.append(ul); host.append(det);
+  }
+}
+
+/* The plan as a picture: one vessel per stage, in order, with what goes into
+   it, and the whole-process settings as the line under them. Drawn from the
+   same first_pass the boxes use, so the two never disagree. A changed lever is
+   lit; a lever the project does not have yet is dashed. */
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svg(tag, attrs, text) {
+  const n = document.createElementNS(SVG_NS, tag);
+  Object.entries(attrs || {}).forEach(([k, v]) => { if (v != null) n.setAttribute(k, String(v)); });
+  if (text != null) n.textContent = text;
+  return n;
+}
+function clipText(t, n) { t = String(t || ''); return t.length > n ? t.slice(0, n - 1) + '…' : t; }
+function vessel(x, y, w, h, cls) {
+  /* A stirred vessel: a rounded tank, a liquid level, the shaft and impeller. */
+  const g = svg('g', { class: 'fl-vessel ' + (cls || ''), transform: `translate(${x} ${y})` });
+  g.append(svg('rect', { x: 0, y: 0, width: w, height: h, rx: 12, class: 'fl-tank' }));
+  g.append(svg('rect', { x: 3, y: h * 0.42, width: w - 6, height: h * 0.58 - 3, rx: 9, class: 'fl-liquid' }));
+  g.append(svg('line', { x1: w / 2, y1: -6, x2: w / 2, y2: h * 0.78, class: 'fl-shaft' }));
+  g.append(svg('path', { d: `M ${w / 2 - 14} ${h * 0.78} l 14 -6 l 14 6 l -14 6 z`, class: 'fl-impeller' }));
+  g.append(svg('rect', { x: w / 2 - 10, y: -12, width: 20, height: 8, rx: 2, class: 'fl-motor' }));
+  return g;
+}
+function renderFlow(fp) {
+  const stages = fp.stages || [];
+  const phys = (fp.physical || []).filter(i => i.stage_id === 'all');
+  const colW = 236, gap = 36, left = 24, top = 44, vW = 92, vH = 104;
+  const rowsMax = Math.max(1, ...stages.map(s => s.inducers.length));
+  const W = left * 2 + stages.length * colW + (stages.length - 1) * gap;
+  const listTop = top + vH + 28;
+  const listH = Math.min(6, rowsMax) * 22 + 12;
+  const physTop = listTop + listH + 26;
+  const H = physTop + (phys.length ? 58 : 10);
+  const root = svg('svg', { viewBox: `0 0 ${W} ${H}`, class: 'flow', role: 'img',
+    'aria-label': 'The recommended process as a line of vessels, with what goes into each' });
+  root.style.minWidth = Math.min(W, 980) + 'px';
+  stages.forEach((s, i) => {
+    const x = left + i * (colW + gap);
+    const g = svg('g', { class: 'fl-stage' });
+    g.append(svg('text', { x: x, y: 18, class: 'fl-title' }, clipText(s.label, 22)));
+    g.append(svg('text', { x: x + colW, y: 18, class: 'fl-days', 'text-anchor': 'end' },
+      s.days == null ? '' : `d${num(s.day_start)}–${num(s.day_start + s.days)}`));
+    const changed = s.inducers.some(it => it.action !== 'keep');
+    g.append(vessel(x + (colW - vW) / 2, top, vW, vH, changed ? 'changed' : ''));
+    const ins = s.inducers.slice(0, 6);
+    if (!ins.length) {
+      g.append(svg('text', { x: x + colW / 2, y: listTop + 16, class: 'fl-none', 'text-anchor': 'middle' },
+        'no inducer set'));
+    }
+    ins.forEach((it, j) => {
+      const y = listTop + j * 22;
+      const row = svg('g', { class: `fl-item act-${it.action}` + (it.registered ? '' : ' new') });
+      row.append(svg('rect', { x: x, y: y, width: colW, height: 19, rx: 6, class: 'fl-pill' }));
+      const verb = it.action === 'keep' ? '' : PLAN_VERB[it.action] + ' ';
+      /* The label and the value share one pill. The value is right-aligned, so
+         an unclipped one ("3 1e6 cells/mL of working volume") grew leftwards
+         over the label and out of the column into the next stage. Both are
+         budgeted against the pill's width; the full text is in the tooltip. */
+      const full = it.value == null ? (it.registered ? '—' : 'dose?')
+        : `${typeof it.value === 'number' ? num(it.value) : it.value}${it.unit ? ' ' + it.unit : ''}`;
+      const val = clipText(full, 14);
+      // Widths per character: the mono value, and the bold sans label.
+      const room = Math.max(6, Math.floor((colW - 30 - val.length * 6.9) / 7.4));
+      row.append(svg('text', { x: x + 8, y: y + 13, class: 'fl-pill-t' },
+        clipText(`${verb}${it.label}`, room)));
+      row.append(svg('text', { x: x + colW - 8, y: y + 13, class: 'fl-pill-v', 'text-anchor': 'end' },
+        val));
+      const t = svg('title');
+      t.textContent = it.text + (it.hypothesis_id ? ` — ${it.hypothesis_id}` : '');
+      row.append(t);
+      g.append(row);
+    });
+    if (s.inducers.length > 6) {
+      g.append(svg('text', { x: x, y: listTop + 6 * 22 + 12, class: 'fl-none' },
+        `+${s.inducers.length - 6} more below`));
+    }
+    if (i < stages.length - 1) {
+      const ax = x + colW + 4, ay = top + vH / 2;
+      g.append(svg('path', { d: `M ${ax} ${ay} h ${gap - 14} m -6 -5 l 6 5 l -6 5`, class: 'fl-arrow' }));
+    }
+    root.append(g);
+  });
+  if (phys.length) {
+    const y = physTop;
+    root.append(svg('line', { x1: left, y1: y, x2: W - left, y2: y, class: 'fl-rail' }));
+    root.append(svg('text', { x: left, y: y + 18, class: 'fl-days' }, 'WHOLE PROCESS'));
+    let cx = left + 118;
+    phys.slice(0, 7).forEach(it => {
+      const label = `${clipText(it.label, 16)} ${it.value == null ? '—' : num(it.value)}${it.unit ? ' ' + it.unit : ''}`;
+      const w = Math.min(240, 14 + label.length * 7.3);
+      if (cx + w > W - left) return;
+      const g = svg('g', { class: `fl-item act-${it.action}` });
+      g.append(svg('rect', { x: cx, y: y + 8, width: w, height: 19, rx: 9, class: 'fl-pill' }));
+      g.append(svg('text', { x: cx + w / 2, y: y + 21, class: 'fl-pill-t', 'text-anchor': 'middle' }, label));
+      const t = svg('title'); t.textContent = it.text; g.append(t);
+      root.append(g);
+      cx += w + 8;
+    });
+  }
+  const wrap = el('div', 'flow-wrap');
+  wrap.append(root);
+  return wrap;
+}
+/* A lever this run named that the project does not have. Shown in its stage
+   with what it proposed, and one click from being registered — which is what
+   turns a blank stage into a protocol a person can run. */
+function proposedItem(c, p, stages) {
+  const row = el('div', 'plan-item new act-add');
+  row.append(el('span', 'plan-verb', 'NEW'));
+  const body = el('span', 'plan-body');
+  body.append(el('b', null, c.label));
+  body.append(el('span', 'v', c.candidate_value != null
+    ? ` ${num(c.candidate_value)}${c.unit ? ' ' + c.unit : ''}`
+    : ` ${c.direction || 'direction only'}`));
+  row.append(body);
+  const add = el('button', 'btn sm', 'Add');
+  add.type = 'button';
+  add.title = 'Register this lever in your project so the protocol can carry its dose';
+  add.addEventListener('click', () => {
+    const open = row.parentNode.querySelector('.regform[data-for="' + c.parameter_id + '"]');
+    if (open) { open.remove(); return; }
+    const f = registerForm(p, c, stages);
+    f.dataset.for = c.parameter_id;
+    row.after(f);
+  });
+  row.append(add);
+  if (c.hypothesis_id) row.append(el('span', 'meta', c.hypothesis_id));
+  return row;
+}
+/* Nothing proposed for a stage does not mean nothing belongs there. */
+function addInducer(p, stageId, stages) {
+  const b = el('button', 'btn sm plan-add', '+ Add an inducer');
+  b.type = 'button';
+  b.title = 'Add a factor you know this stage needs, and its dose range';
+  b.addEventListener('click', () => {
+    const open = b.parentNode.querySelector('.regform[data-for="new"]');
+    if (open) { open.remove(); return; }
+    const f = registerForm(p, { stage_id: stageId }, stages);
+    f.dataset.for = 'new';
+    b.after(f);
+  });
+  return b;
+}
+
+/* The plan across the full width of the page. Not an overlay: the two-column
+   layout becomes one column, so the plan gets the whole width and everything
+   else is still there, below it. */
+function toggleFocus(on) {
+  const panel = $('#protocolPanel'); if (!panel) return;
+  const want = on == null ? !panel.classList.contains('wide') : !!on;
+  panel.classList.toggle('wide', want);
+  document.body.classList.toggle('plan-wide', want);
+  const btn = panel.querySelector('.rv-actions .btn.sm');
+  if (btn) btn.textContent = want ? 'Narrow' : 'Widen';
+  try { localStorage.setItem('bs-plan-wide', want ? '1' : '0'); } catch (_) {}
+  if (want) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') toggleFocus(false); });
+
+/* The plan a person takes to the bench: one box per stage with the inducers
+   given in it, then the physical settings. Built by the server from the
+   protocol (first_pass.py); a NEW lever is a live hypothesis's, not yet the
+   project's, and says so. */
+const PLAN_VERB = { add: 'ADD', raise: 'RAISE', lower: 'LOWER', set: 'SET', gap: 'NO VALUE' };
+function planItem(i, withStage, p, stages) {
+  const row = el('div', `plan-item act-${i.action}${i.registered ? '' : ' new'}`
+    + (i.from_baseline ? ' pub' : ''));
+  row.title = [i.text, i.why, i.hypothesis_id ? `from ${i.hypothesis_id}` : '',
+    (i.refs || []).length ? (i.refs || []).join(', ') : ''].filter(Boolean).join(' — ');
+  if (PLAN_VERB[i.action]) row.append(el('span', 'plan-verb', PLAN_VERB[i.action]));
+  const body = el('span', 'plan-body');
+  body.append(el('b', null, i.label));
+  /* A published factor with no dose and one this project cannot carry are
+     different sentences: the first means nobody reports a number, the second
+     means there is nowhere to put one. */
+  body.append(el('span', 'v', i.value == null
+    ? (i.from_baseline ? ' no dose published' : i.registered ? ' —' : ' dose not set')
+    : ` ${num(i.value)}${i.unit ? ' ' + i.unit : ''}`));
+  if (i.from_baseline && i.timing) body.append(el('span', 'dim', ` · ${i.timing}`));
+  if (i.was != null) body.append(el('span', 'was', `was ${num(i.was)}`));
+  if (withStage && i.stage_id !== 'all' && i.stage_label) body.append(el('span', 'dim', ` · ${i.stage_label}`));
+  row.append(body);
+  const meta = el('span', 'meta');
+  meta.append(el('span', 'pl ' + i.provenance, i.letter));
+  if (i.confidence) meta.append(miniBar(i.confidence));
+  if (i.hypothesis_id) meta.append(el('span', 'dim', i.hypothesis_id));
+  if (i.from_baseline) {
+    meta.append(el('span', 'dim', i.role || 'published'));
+    (i.refs || []).slice(0, 2).forEach(r => meta.append(el('span', 'ref', r)));
+  }
+  row.append(meta);
+  /* An unregistered lever is one click from being carried: the protocol can
+     hold its dose as soon as the project has the parameter. */
+  if (!i.registered && p) {
+    const add = el('button', 'btn sm', 'Add');
+    add.type = 'button';
+    add.title = 'Register this lever in your project so the protocol can carry its dose';
+    add.addEventListener('click', () => {
+      const open = row.parentNode.querySelector('.regform[data-for="' + i.parameter_id + '"]');
+      if (open) { open.remove(); return; }
+      const f = registerForm(p, { parameter_id: i.parameter_id, label: i.label, unit: i.unit,
+                                  stage_id: i.stage_id, candidate_value: i.value,
+                                  hypothesis_id: i.hypothesis_id }, stages || []);
+      f.dataset.for = i.parameter_id;
+      row.after(f);
+    });
+    row.append(add);
+  }
+  return row;
+}
+/* A stage's length, editable. Fixed day ranges drawn from the profile made
+   every plan look like the same process; the number belongs to whoever runs
+   it. Bounds come from the project, so a typo cannot make a 2-day expansion
+   into 200. */
+function stageDays(s, p) {
+  const wrap = el('span', 'days');
+  const text = s.days == null ? 'days not set'
+    : `d${num(s.day_start)}–${num(s.day_start + s.days)}`;
+  const label = el('span', null, text);
+  wrap.append(label);
+  const project = (p || {}).project || {};
+  const pid = project.project_id || currentProject();
+  if (!pid || !state.run) return wrap;
+  const edit = el('button', 'btn del', '✎');
+  edit.type = 'button';
+  edit.title = `How long ${s.label} runs in your process (now ${num(s.days)} d)`;
+  edit.setAttribute('aria-label', edit.title);
+  edit.addEventListener('click', async () => {
+    const asked = prompt(`How many days does ${s.label} run in your process?`
+      + '\n\nThis is your project\u2019s own stage length, not a recommendation from the '
+      + 'run. The plan and the timeline redraw against it.', s.days == null ? '' : num(s.days));
+    if (asked === null) return;
+    const days = parseFloat(asked);
+    if (!(days > 0)) { note('A stage length is a number of days.'); return; }
+    edit.disabled = true;
+    try {
+      const d = await post(`/api/projects/${encodeURIComponent(pid)}/stages/`
+        + `${encodeURIComponent(s.stage_id)}/days`, { days, run_id: state.run.run_id });
+      note(d.note);
+      if (d.protocol_rebuilt) setTimeout(() => watchRun(state.run.run_id), 600);
+    } catch (e) { fail(e); } finally { edit.disabled = false; }
+  });
+  wrap.append(edit);
+  return wrap;
+}
+
+function renderPlan(fp, p) {
+  const wrap = el('div', 'plan');
+  const boxes = el('div', 'plan-stages');
+  const stages = ((p || {}).timeline || {}).stages || [];
+  const proposed = ((p || {}).timeline || {}).candidates || [];
+  fp.stages.forEach(s => {
+    const b = el('div', 'plan-stage');
+    const h = el('div', 'plan-head');
+    h.append(el('strong', null, s.label));
+    /* The day range is the project's own stage length, not a recommendation —
+       and it is a fact about this person's process, so they can change it
+       here rather than reading a number that is wrong for their system. */
+    h.append(stageDays(s, p));
+    b.append(h, el('div', 'plan-lab', 'Inducers'));
+    /* An empty stage means one thing only: this project has no factor
+       parameter for it, so no dose can be carried here however much the
+       literature says. Saying that — and offering what the run proposed —
+       is the difference between a blank box and a next step. */
+    if (!s.inducers.length) {
+      const bs = ((p || {}).baseline_protocol || {}).stages || [];
+      const found = bs.find(x => x.stage_id === s.stage_id);
+      b.append(el('p', 'dim plan-none', found && !found.addressed
+        ? 'This run established nothing for this stage: no source it read says what goes '
+          + 'in here. That is a gap in the evidence, not a stage that needs nothing.'
+        : 'This project has no inducer registered for this stage, so the protocol cannot '
+          + 'carry a dose here yet.'));
+    }
+    s.inducers.forEach(i => b.append(planItem(i, false, p, stages)));
+    // Only what this stage does not already show: a lever placed in the stage
+    // above is the same lever, and listing it twice reads as two things.
+    const here = new Set(s.inducers.map(i => i.parameter_id));
+    const mine = proposed.filter(c => (c.stage_id || null) === s.stage_id
+                                      && !here.has(c.parameter_id));
+    if (mine.length) {
+      b.append(el('div', 'plan-lab', 'This run proposed'));
+      mine.forEach(c => b.append(proposedItem(c, p, stages)));
+    }
+    if (p) b.append(addInducer(p, s.stage_id, stages));
+    boxes.append(b);
+  });
+  wrap.append(boxes);
+  if ((fp.unstaged || []).length) {
+    wrap.append(el('div', 'plan-lab', 'Inducers — stage not stated by the hypothesis'));
+    const g = el('div', 'plan-grid');
+    fp.unstaged.forEach(i => g.append(planItem(i, false, p, stages)));
+    wrap.append(g);
+  }
+  if ((fp.physical || []).length) {
+    wrap.append(el('div', 'plan-lab', 'Physical parameters'));
+    const g = el('div', 'plan-grid');
+    fp.physical.forEach(i => g.append(planItem(i, true, p, stages)));
+    wrap.append(g);
+  }
+  /* What else this run surfaced that could go in the vessel, sorted by what
+     stands behind each. Designing a round means choosing conditions, and an
+     empty stage is not the same as nothing being available. */
+  const cat = (p || {}).options;
+  if (cat && cat.count) wrap.append(conditionPicker(cat));
+  /* The same protocol in a plate, a tube or a tank. Most people cannot start
+     in a bioreactor, and a protocol they cannot start is a protocol they do
+     not use. */
+  if (p && state.run && state.run.run_id) {
+    wrap.append(el('div', 'plan-lab', 'This protocol in another vessel'));
+    if (p.culture_format) {
+      wrap.append(el('p', 'dim', 'Written for: '
+        + ({ six_well: 'a 6-well plate', cero: 'a CERO 3D rotating tube',
+          stirred_tank: 'a stirred-tank bioreactor' }[p.culture_format] || p.culture_format)));
+    }
+    wrap.append(formatPanel(p, state.run));
+  }
+  wrap.append(el('p', 'caveat plan-note', fp.note
+    + (fp.baseline_stages ? ' PUB marks a factor the published route uses that this protocol '
+      + 'does not carry — what the literature states, not a value this run set or anybody '
+      + 'approved. GAP marks one the route needs that no source doses.' : '')
+    + ' R reported · A adapted · D design choice.'));
+  return wrap;
+}
+
+function renderBenchmark(b) {
+  const host = $('#benchmark'); if (!host) return;
+  host.textContent = '';
+  $('#benchPanel').hidden = false;
+  const head = el('div', 'ev-row');
+  head.append(el('span', 'rt-badge ' + (b.mode === 'ai' ? 'local_real_ai' : 'synthetic_demo'),
+    b.mode === 'ai' ? 'AI-DRIVEN' : 'DETERMINISTIC'));
+  head.append(el('span', 'flag', b.privacy.badge));
+  host.append(head);
+  host.append(el('h4', null, b.title || b.benchmark_id));
+  host.append(el('p', 'mut', b.objective));
+  host.append(el('p', 'caveat', b.scorecard.headline));
+  const tbl = el('table', 'ledger');
+  const tb = el('tbody');
+  b.scorecard.rows.forEach(r => {
+    const tr = el('tr', r.status === 'PASS' ? 'kept' : 'dropped');
+    tr.append(el('td', null, r.capability.replace(/_/g, ' ')));
+    tr.append(el('td', 'st', r.status));
+    tr.append(el('td', null, r.detail || ''));
+    tb.append(tr);
+  });
+  tbl.append(tb); host.append(tbl);
+  if (b.privacy.refusal_reason) host.append(el('p', 'caveat', b.privacy.refusal_reason));
+  $('#benchPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+/* Each specialist's section as a document of its own, from where it is read:
+   the papers, the evidence rows and the notes; the analyses, datasets and
+   genes. Built from the run's files, so it works for any run. */
+function renderSectionExports(snap) {
+  $$('.sec-export').forEach(host => {
+    host.textContent = '';
+    host.hidden = !snap.run_id;
+    if (!snap.run_id) return;
+    const sec = host.dataset.section;
+    const name = { literature: 'the literature', bioinformatics: 'the bioinformatics',
+      breakthrough: 'the design past the apparatus' }[sec] || sec;
+    const a = (fmt, label) => {
+      const l = el('a', 'btn sm', label);
+      l.href = `/api/discovery/${encodeURIComponent(snap.run_id)}/export?section=${sec}&format=${fmt}`;
+      l.target = '_blank'; l.rel = 'noopener';
+      l.title = `Download ${name} of this run as ${label}`;
+      return l;
+    };
+    host.append(el('span', 'dim', 'Export this section'), a('pdf', 'PDF'), a('docx', 'Word'));
+  });
+}
+
+function exportLink(id, fmt, label, extra) {
+  const a = el('a', 'btn', label);
+  a.href = `/api/discovery/${id}/protocol?format=${fmt}${extra || ''}`;
+  a.target = '_blank'; a.rel = 'noopener';
+  return a;
+}
+
+/* What the person asked to change in the bench copy — in chat, or here —
+   and that every export now carries. The run's own protocol is untouched. */
+function renderProtocolEdits(host, snap) {
+  const e = snap.protocol_edits;
+  const box = el('div', 'pe-box');
+  if (e) {
+    box.append(el('div', 'lab', 'Changes you asked for, carried by every export'));
+    const ul = el('ul', 'tight');
+    if (e.culture_format) ul.append(el('li', null, `Laid out for ${e.culture_format.replace('_', ' ')}`
+      + (e.working_volume_ml ? ` at ${num(e.working_volume_ml)} mL` : '')));
+    if (e.title) ul.append(el('li', null, `Title: ${e.title}`));
+    (e.values || []).forEach(v => ul.append(el('li', null,
+      `${v.label || v.parameter_id} = ${num(v.value)} ${v.unit || ''} in ${v.stage_label || v.stage_id}`
+      + ` — D, asked for by ${v.requested_by || 'you'}`)));
+    (e.notes || []).forEach(n => ul.append(el('li', null,
+      `${n.stage_label || 'whole run'}: ${n.text} — P`)));
+    if ((e.omit || []).length) ul.append(el('li', null, 'Left out: ' + e.omit.join(', ')));
+    box.append(ul);
+    box.append(el('p', 'caveat', e.does_not_change || ''));
+    const row = el('div', 'row');
+    row.append(exportLink(snap.run_id, 'docx', 'Word without these changes', '&edits=none'),
+      exportLink(snap.run_id, 'pdf', 'PDF without these changes', '&edits=none'));
+    const clear = el('button', 'btn', 'Remove the changes');
+    clear.addEventListener('click', async () => {
+      clear.disabled = true;
+      try {
+        await post(`/api/discovery/${snap.run_id}/protocol-edits`, { clear: true });
+        const s = await get(`/api/discovery/${snap.run_id}`); state.run = s; renderExports(s);
+      } catch (err) { fail(err); clear.disabled = false; }
+    });
+    row.append(clear);
+    box.append(row);
+  } else {
+    box.append(el('p', 'note', 'To change the bench copy — the vessel, a value of yours, a note, '
+      + 'a section left out — ask the orchestrator under "Ask the orchestrator" with "Change '
+      + 'the protocol document", or give it directly here.'));
+  }
+  /* The direct way: no orchestrator, the same checks. For a demo run, which
+     has no orchestrator to ask, it is the only way. */
+  const form = el('details', 'pe-form');
+  form.append(el('summary', null, e ? 'Edit the changes directly' : 'Give the changes directly'));
+  const ta = el('textarea');
+  ta.rows = 6; ta.spellcheck = false;
+  ta.value = JSON.stringify(e ? {
+    culture_format: e.culture_format, working_volume_ml: e.working_volume_ml, title: e.title,
+    values: (e.values || []).map(v => ({ parameter_id: v.parameter_id, stage_id: v.stage_id,
+      value: v.value, unit: v.unit, timing: v.timing, rationale: v.rationale,
+      derived_from: v.derived_from, confidence: v.confidence })),
+    notes: (e.notes || []).map(n => ({ stage_id: n.stage_id, text: n.text })), omit: e.omit || [],
+  } : { culture_format: 'six_well', working_volume_ml: 2, values: [], notes: [], omit: [] }, null, 1);
+  const go = el('button', 'btn go', 'Apply to the exports');
+  const msg = el('span', 'dim');
+  go.addEventListener('click', async () => {
+    go.disabled = true; msg.textContent = '';
+    try {
+      const body = JSON.parse(ta.value);
+      await post(`/api/discovery/${snap.run_id}/protocol-edits`, body);
+      const s = await get(`/api/discovery/${snap.run_id}`); state.run = s; renderExports(s);
+    } catch (err) { msg.textContent = err.message || String(err); go.disabled = false; }
+  });
+  const r = el('div', 'row'); r.append(go, msg);
+  form.append(el('p', 'note', 'A value names a parameter this project has, in its own unit, '
+    + 'with a stage, a rationale, what it was reasoned from and a confidence; it is refused '
+    + 'otherwise, with the reason. A note is your own instruction. Sections that can be left '
+    + 'out: glance, testing, materials, settings, bench, measure, round, alternates, letters, '
+    + 'limitations.'), ta, r);
+  box.append(form);
+  host.append(box);
+}
+
+function renderExports(snap) {
+  const host = $('#exports'); if (!host) return;
+  host.textContent = '';
+  const id = snap.run_id;
+  const mk = (label, href, note) => {
+    const a = el('a', 'btn', label);
+    a.href = href; a.target = '_blank'; a.rel = 'noopener';
+    host.append(a);
+    if (note) host.append(el('div', 'note', note));
+  };
+  if (snap.result && snap.result.protocol) {
+    /* The bench copy first: a Word file or a PDF is what gets printed, signed
+       and emailed to whoever actually runs it. Markdown is for the repository. */
+    /* The round on one page first: the arms, the vessel, the stages — the
+       picture drawn on a whiteboard before a round. The full copy after it. */
+    const glance = el('div', 'row');
+    glance.append(exportLink(id, 'pdf', 'Round at a glance (PDF)', '&view=plan'),
+      exportLink(id, 'docx', 'Round at a glance (Word)', '&view=plan'));
+    host.append(glance);
+    host.append(el('div', 'note', 'One landscape page: the stages drawn to scale, one row per '
+      + 'arm, and in each cell what that arm gets at that stage, with every change from the '
+      + 'control shaded.'));
+    const row = el('div', 'row');
+    row.append(exportLink(id, 'docx', 'Protocol for the bench (Word)'),
+      exportLink(id, 'pdf', 'Protocol for the bench (PDF)'));
+    host.append(row);
+    host.append(el('div', 'note',
+      'The same protocol in the order the work happens: what is still undecided, the whole '
+      + 'process on one page, materials, each stage as lines to tick off with every dose and '
+      + 'its letter, the vessel settings, what to measure, the round one vessel per row, and '
+      + 'an approval block for a named person to sign. Nothing in it is approved.'));
+    /* Everything at the end, as one document: cover, executive summary, the
+       process stage by stage as it looks at the bench, then the protocol and
+       each specialist's section as chapters. The narrative layer appears in it
+       once the communication agent has written one ("Write the run up" in the
+       Ask box); the report renders without it too. */
+    const rep = el('div', 'row');
+    rep.append(exportLink(id, 'pdf', 'Final report (PDF)', '&view=report'),
+      exportLink(id, 'docx', 'Final report (Word)', '&view=report'));
+    host.append(rep);
+    host.append(el('div', 'note', 'The whole run as one document a reader outside the loop '
+      + 'can follow: summary, the process at the bench stage by stage, the round, the full '
+      + 'protocol, and the literature and bioinformatics sections as chapters. Nothing in it '
+      + 'is approved.'));
+    renderProtocolEdits(host, snap);
+    mk('Export protocol (Markdown)', `/api/discovery/${id}/protocol?format=md`,
+      'The recommended protocol, its provenance tags and the hypothesis ledger.');
+    mk('Process figure (SVG)', `/api/discovery/${id}/protocol?format=svg`,
+      'The stages to scale with what goes into each, as a picture; add &theme=dark for the '
+      + 'dark variant.');
+  }
+  const b = el('button', 'btn go', 'Create benchmark from this run');
+  b.addEventListener('click', async () => {
+    b.disabled = true;
+    try {
+      const out = await post(`/api/discovery/${id}/benchmark`);
+      state.benchmark = out.benchmark;
+      renderBenchmark(out.benchmark);
+      loadBenchmarks();
+    } catch (e) { fail(e); } finally { b.disabled = false; }
+  });
+  host.append(b);
+  host.append(el('div', 'note',
+    'Built from the artifacts this run already produced. The biology is not run again.'));
+}
+
+/* ── creating a project ───────────────────────────────────────────────────
+   A project is a durable scientific workspace, so this writes one on the server
+   and then selects it. Nothing about a project lives in this page: refreshing,
+   restarting the server or redeploying leaves it exactly where it was. */
+async function createProject(ev) {
+  ev.preventDefault();
+  const msg = $('#npMsg');
+  const name = $('#npName').value.trim();
+  if (name.length < 3) { msg.textContent = 'a project needs a name'; return; }
+  msg.textContent = 'creating…';
+  const body = {
+    name,
+    species: $('#npSpecies').value.trim(),
+    starting_cell: $('#npStart').value.trim(),
+    target_cell: $('#npTarget').value.trim(),
+    cell_state: $('#npState').value.trim(),
+    process_context: $('#npProcess').value.trim(),
+    goal: $('#npGoal').value.trim(),
+  };
+  const template = $('#npTemplate').value;
+  if (template) { body.template_of = template; } else { body.quick = true; }
+  try {
+    const d = await post('/api/projects', body);
+    msg.textContent = '';
+    $('#newProjectCard').hidden = true;
+    $('#newProjectForm').reset();
+    /* Selected immediately, and nothing else disturbed: a run in another
+       project keeps working while this one is created. */
+    await loadProjects(d.selected || d.project_id);
+    await BS.runs(currentProject()).catch(() => {});
+  } catch (e) {
+    msg.textContent = e.message || 'could not create that project';
+  }
+}
+
+async function loadProjectTemplates() {
+  const sel = $('#npTemplate'); if (!sel) return;
+  sel.textContent = '';
+  sel.append(Object.assign(el('option', null, 'None — shared bioreactor set only'),
+    { value: '' }));
+  try {
+    const d = await get('/api/project-templates');
+    (d.templates || []).forEach(t => {
+      const o = el('option', null, `${t.name || t.project_id}`
+        + (t.has_simulator ? '  (has a model)' : '  (no model)'));
+      o.value = t.project_id; sel.append(o);
+    });
+  } catch (_) { /* the form still works without templates */ }
+}
+
+/* ── wiring ──────────────────────────────────────────────────────────────── */
+function wire() {
+  const af = $('#askForm');
+  if (af) af.addEventListener('submit', askQuestion);
+  const alt = $('#altBtn');
+  if (alt) alt.addEventListener('click', () => askQuestion(null, 'alternate'));
+  const edit = $('#editBtn');
+  if (edit) edit.addEventListener('click', () => askQuestion(null, 'protocol'));
+  const beyond = $('#btBtn');
+  if (beyond) beyond.addEventListener('click', () => askQuestion(null, 'breakthrough'));
+  const rep = $('#repBtn');
+  if (rep) rep.addEventListener('click', () => askQuestion(null, 'report'));
+  const np = $('#newProjectBtn');
+  if (np) {
+    np.addEventListener('click', () => {
+      const card = $('#newProjectCard');
+      card.hidden = !card.hidden;
+      if (!card.hidden) { loadProjectTemplates(); $('#npName').focus(); }
+    });
+    $('#npCancel').addEventListener('click', () => { $('#newProjectCard').hidden = true; });
+    $('#newProjectForm').addEventListener('submit', createProject);
+  }
+  const pd = $('#projectDetailBtn');
+  if (pd) {
+    pd.addEventListener('click', () => {
+      const host = $('#projectDetail');
+      const open = host.hidden;
+      pd.setAttribute('aria-expanded', String(open));
+      if (open) renderProjectDetail(currentProject()); else host.hidden = true;
+    });
+  }
+  $('#runBtn').addEventListener('click', start);
+  $('#stopBtn').addEventListener('click', stopFromButton);
+  const add = $('#candAdd');
+  if (add) {
+    add.addEventListener('click', () => {
+      const pid = $('#candParam').value;
+      const raw = ($('#candValue').value || '').trim();
+      const v = Number(raw);
+      if (!pid || raw === '' || !isFinite(v)) return;
+      state.candidates = state.candidates || {};
+      state.candidates[pid] = v;
+      $('#candValue').value = '';
+      renderCandidatePicks();
+    });
+  }
+  const sign = $('#signinForm');
+  if (sign) {
+    sign.addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const msg = $('#signinMsg'); msg.textContent = 'signing in…';
+      try {
+        await post('/api/auth/login', {
+          server: $('#signinServer').value.trim(),
+          username: $('#signinUser').value.trim(),
+          password: $('#signinPass').value,
+        });
+        location.reload();
+      } catch (e) { msg.textContent = e.message || 'sign-in failed'; }
+    });
+  }
+}
+
+boot();

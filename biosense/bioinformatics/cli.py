@@ -1,0 +1,702 @@
+"""Bioinformatics CLI for the orchestrator and the bioinformatics agent.
+
+Two families of command. The older one answers "what does an annotation say about
+this gene"; the newer one answers "what data exists, what analysis would reduce
+this uncertainty, and what did it find".
+
+    datasets register|list|search|show     describe and find datasets
+    analyse plan|run                       plan against a named uncertainty, execute it
+    tools                                  what can run, and what is only declared
+
+
+    .venv/bin/python -m biosense.bioinformatics.cli annotate --genes EXH1 --perturbation knockout \
+        --cell-type "CAR-T cell" --protocol runs/loop1/it1/protocol.approved.json --out runs/loop1/it1/bioinfo.json
+
+Deterministic and offline. A gene with no annotation returns found=false plus the
+public queries to run; `live-lookup` performs them only when you ask for it.
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from .. import contracts as K
+from . import knowledge as KB
+from . import tools as BT
+
+
+def _print(obj):
+    print(json.dumps(obj, indent=2, ensure_ascii=False, default=str))
+
+
+def cmd_annotate(a):
+    report = BT.annotate(a.genes, perturbation=a.perturbation, cell_type=a.cell_type,
+                         knowledge_sets=a.knowledge_set, loop_id=a.loop_id, iteration=a.iteration,
+                         question=a.question, asked_by=a.asked_by)
+    out = {'report_id': report['report_id'],
+           'genes': [{'symbol': g['symbol'], 'found': g['found'], 'status': g['status'],
+                      'effects': [{k: e[k] for k in ('affected_process', 'direction', 'readout_metric',
+                                                     'confidence')} for e in g['effects']],
+                      'live_lookup_plan': [p['source'] for p in (g['live_lookup_plan'] or [])] or None}
+                     for g in report['genes']],
+           'lever_suggestions': report['lever_suggestions'],
+           'untestable_here': [u['assay'] for u in report['untestable_here']],
+           'limitations': report['limitations']}
+    if a.protocol:
+        protocol = K.read_json(a.protocol)
+        cross = BT.cross_check(report, protocol)
+        report['protocol_cross_check'] = cross
+        out['protocol_cross_check'] = cross
+    if a.out:
+        p = Path(a.out)
+        # Validate the object that is actually written, not the one that existed
+        # before the cross-check was attached. An artifact on disk that fails its
+        # own schema is a contract that only looks enforced.
+        K.require_valid('bioinformatics_report', report)
+        K.write_json_atomic(p, report)
+        K.write_text_atomic(p.with_suffix('.md'), BT.render_report(report))
+        out['out'] = str(p)
+        out['report'] = str(p.with_suffix('.md'))
+    _print(out)
+    return 0 if any(g['found'] for g in report['genes']) else 2
+
+
+def _emit(doc, out):
+    if out:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        K.write_json_atomic(out, doc)
+    _print(doc)
+    return 0
+
+
+def cmd_gene_info(a):
+    if not a.i_have_network_permission:
+        _print({'refused': 'gene-info touches the network. Pass --i-have-network-permission only '
+                           'when the run permits public-database access.'})
+        return 1
+    return _emit(BT.gene_info([KB.validate_symbol(g) for g in a.genes]), a.out)
+
+
+def cmd_geo_samples(a):
+    from ..data.sources import geo_fetch as GF
+    doc = GF.samples(a.accession, i_have_network_permission=a.i_have_network_permission)
+    if not a.out:
+        # The full sample list can be long; the console gets the part a choice needs.
+        doc = dict(doc, samples=doc['samples'][:12], samples_total=len(doc['samples']))
+    return _emit(doc, a.out)
+
+
+def cmd_from_papers(a):
+    from ..data.sources import paper_data as PD
+    return _emit(PD.for_papers(a.papers, i_have_network_permission=a.i_have_network_permission),
+                 a.out)
+
+
+def cmd_fetch_geo(a):
+    from ..data.sources import geo_fetch as GF
+    keep = {}
+    for kv in a.keep or []:
+        if '=' not in kv:
+            raise K.ContractError(f'--keep takes FIELD=VALUE, got {kv!r}')
+        k, v = kv.split('=', 1)
+        keep[k.strip()] = v.strip()
+    cmap = {}
+    for kv in a.column_map or []:
+        if '=' not in kv:
+            raise K.ContractError(f'--column-map takes HEADER=GSM, got {kv!r}')
+        h, g = kv.rsplit('=', 1)
+        cmap[h.strip()] = g.strip()
+    doc = GF.fetch(a.accession, condition_key=a.condition_key, control=a.control,
+                   treatments=a.treatment, keep=keep, genes=a.genes, max_genes=a.max_genes,
+                   dataset_id=a.dataset_id, cell_type=a.cell_type,
+                   supplementary=a.supplementary, column_map=cmap or None,
+                   infer_columns=a.infer_columns, column_map_basis=a.column_map_basis,
+                   time_key=a.time_key,
+                   i_have_network_permission=a.i_have_network_permission)
+    return _emit(doc, a.out)
+
+
+def _pairs(items, what):
+    out = {}
+    for kv in items or []:
+        if '=' not in kv:
+            raise K.ContractError(f'{what} takes KEY=VALUE, got {kv!r}')
+        k, v = kv.split('=', 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def cmd_fetch_peaks(a):
+    from ..data.sources import geo_peaks as GP
+    doc = GP.fetch_peaks(a.accession, condition_key=a.condition_key, control=a.control,
+                         treatments=a.treatment, keep=_pairs(a.keep, '--keep'),
+                         replicates=a.replicates, pick=a.pick,
+                         peak_files=_pairs(a.peak_file, '--peak-file') or None,
+                         modality=a.modality, dataset_id=a.dataset_id, cell_type=a.cell_type,
+                         i_have_network_permission=a.i_have_network_permission)
+    return _emit(doc, a.out)
+
+
+def cmd_register_peaks(a):
+    from ..data import ingest as ING
+    files = _pairs(a.peaks, '--peaks')
+    for cond in [a.control] + list(a.treatment):
+        if cond not in files:
+            raise K.ContractError(f'--peaks names no file for {cond!r}: give CONDITION=PATH '
+                                  f'for the control and every treatment')
+    paths = list(files.values())
+    m, path = ING.ingest_peaks(
+        paths[0], extra_files=paths[1:], dataset_id=a.dataset_id, title=a.title,
+        modality=a.modality, organism=a.organism, cell_type=a.cell_type,
+        experimental_design={'condition_column': 'condition', 'control': a.control,
+                             'treatments': list(a.treatment), 'replicate_column': None},
+        peak_files=files, description=a.description, registered_by=a.registered_by,
+        visibility=a.visibility, overwrite=a.overwrite)
+    _print({'dataset_id': m['dataset_id'], 'manifest': str(path), 'modality': m['modality'],
+            'visibility': m['visibility'], 'peak_files': m['modality_detail']['peak_files'],
+            'next': f'analyse plan --dataset-ids {m["dataset_id"]} --analysis-type '
+                    f'peak_overlap_comparison --tool chromatin.peak_overlap ...'})
+    return 0
+
+
+def _sc_kw(a):
+    return dict(cell_id_column=a.cell_id_column, sample_column=a.sample_column,
+                condition_column=a.condition_column, control=a.control,
+                treatments=a.treatment, time_column=a.time_column,
+                cell_type_column=a.cell_type_column, cell_types=a.population or (),
+                cells_in_matrix_order=a.cells_in_matrix_order,
+                feature_name_column=a.feature_name_column, genes=a.genes,
+                max_genes=a.max_genes, min_cells=a.min_cells)
+
+
+def cmd_fetch_sc(a):
+    from ..data.sources import single_cell as SC
+    doc = SC.fetch(a.accession, matrix=a.matrix, features=a.features, cells=a.cells,
+                   barcodes=a.barcodes, dataset_id=a.dataset_id, cell_type=a.cell_type,
+                   organism=a.organism,
+                   i_have_network_permission=a.i_have_network_permission, **_sc_kw(a))
+    return _emit(doc, a.out)
+
+
+def cmd_pseudobulk(a):
+    from ..data.sources import single_cell as SC
+    doc = SC.register_local(matrix=a.matrix, features=a.features, cells=a.cells,
+                            barcodes=a.barcodes, dataset_id=a.dataset_id, title=a.title,
+                            organism=a.organism, cell_type=a.cell_type,
+                            registered_by=a.registered_by, overwrite=a.overwrite, **_sc_kw(a))
+    return _emit(doc, a.out)
+
+
+def cmd_register_h5ad(a):
+    from ..data import ingest as ING
+    design = {k: v for k, v in (('condition_column', a.condition_column), ('control', a.control),
+                                ('sample_id_column', a.sample_id_column),
+                                ('timepoint_column', a.timepoint_column),
+                                ('donor_column', a.donor_column)) if v}
+    if a.treatment:
+        design['treatments'] = list(a.treatment)
+    m, path = ING.ingest_h5ad(a.file, dataset_id=a.dataset_id, title=a.title,
+                              organism=a.organism, cell_type=a.cell_type,
+                              experimental_design=design, registered_by=a.registered_by,
+                              visibility=a.visibility, overwrite=a.overwrite)
+    _print({'dataset_id': m['dataset_id'], 'manifest': str(path),
+            'n_cells': m['modality_detail']['n_cells'],
+            'obs_keys': m['modality_detail']['obs_keys'],
+            'missing_metadata': m['missing_metadata']})
+    return 0
+
+
+def cmd_fetch_genesets(a):
+    from . import genesets as GS
+    return _emit(GS.fetch(a.library, i_have_network_permission=a.i_have_network_permission),
+                 None)
+
+
+def cmd_add_genesets(a):
+    from . import genesets as GS
+    return _emit(GS.add_local(a.file, name=a.name, license=a.license, added_by=a.added_by), None)
+
+
+def cmd_genesets(a):
+    from . import genesets as GS
+    return _emit(GS.available(), None)
+
+
+def cmd_live_lookup(a):
+    if not a.i_have_network_permission:
+        _print({'refused': 'live lookups touch the network. Pass --i-have-network-permission only when the '
+                           'request sets bioinformatics.live_lookups true.'})
+        return 1
+    res = BT.live_lookup(a.gene, sources=a.source or None, timeout=a.timeout)
+    if a.out:
+        K.write_json_atomic(a.out, res)
+        res = {**res, 'out': a.out}
+    _print({k: v for k, v in res.items() if k != 'results'} |
+           {'results': [{'source': r['source'], 'url': r['url'], 'bytes': len(json.dumps(r['payload']))}
+                        for r in res.get('results', [])]})
+    return 0
+
+
+def cmd_plan(a):
+    _print({'symbol': a.gene, 'live_lookup_plan': KB.live_lookup_plan(a.gene),
+            'note': 'Run these yourself, or with live-lookup when the request permits network access. '
+                    'Curate the result into bioinfo_knowledge/ before a decision relies on it.'})
+    return 0
+
+
+# ── datasets ──────────────────────────────────────────────────────────────
+
+def cmd_datasets_register(a):
+    from ..data import ingest as ING
+    design = {}
+    for key, val in (('condition_column', a.condition_column), ('control', a.control),
+                     ('replicate_column', a.replicate_column), ('batch_column', a.batch_column),
+                     ('sample_id_column', a.sample_id_column), ('donor_column', a.donor_column),
+                     ('timepoint_column', a.timepoint_column)):
+        if val:
+            design[key] = val
+    if a.treatment:
+        design['treatments'] = list(a.treatment)
+    m, path = ING.ingest_local(
+        a.file, dataset_id=a.dataset_id, title=a.title, modality=a.modality,
+        organism=a.organism, cell_type=a.cell_type, perturbation=a.perturbation,
+        experimental_design=design, description=a.description, registered_by=a.registered_by,
+        visibility=a.visibility, overwrite=a.overwrite)
+    _print({'dataset_id': m['dataset_id'], 'manifest': str(path),
+            'visibility': m['visibility'], 'evidence_class': m['evidence_class'],
+            'modality': m['modality'], 'citable': m['citable'],
+            'checksums': [f['checksum_sha256'] for f in m['files']],
+            'sample_count': (m['sample_metadata'] or {}).get('sample_count'),
+            'missing_metadata': m['missing_metadata'],
+            'note': ('Private. Stored under the private data root, never served over HTTP, never '
+                     'committed, and never a literature citation.'
+                     if m['visibility'] == 'private' else 'Public.')})
+    return 0
+
+
+def cmd_datasets_list(a):
+    from ..data import registry as DREG
+    rows = [DREG.summary(m) for m in DREG.list_datasets(include_private=not a.public_only)]
+    _print({'datasets': rows, 'count': len(rows),
+            'private_included': not a.public_only})
+    return 0
+
+
+def cmd_datasets_show(a):
+    from ..data import registry as DREG
+    m = DREG.require(a.dataset_id)
+    _print({'manifest': m, 'lineage': DREG.lineage_of(a.dataset_id)})
+    return 0
+
+
+def cmd_datasets_search(a):
+    from ..data import sources
+    src = sources.get(a.source)
+    res = src.search(a.query, organism=a.organism, modality=a.modality,
+                     cell_type=a.cell_type, perturbation=a.perturbation, limit=a.limit,
+                     live=a.live, i_have_network_permission=a.i_have_network_permission)
+    _print(res.to_dict())
+    return 0
+
+
+# ── analysis ──────────────────────────────────────────────────────────────
+
+def cmd_analyse_plan(a):
+    from . import plan as PLAN
+    if not a.hypothesis and not a.evidence_gap:
+        raise K.ContractError(
+            'name what this analysis resolves: --evidence-gap <id> for a gap you are recording '
+            'now (with --uncertainty saying what is unknown), or --hypothesis <id> for one from '
+            'an analysis report. --uncertainty alone is the words without the reference.')
+    unc = ({'kind': 'hypothesis', 'ref': a.hypothesis, 'statement': a.uncertainty,
+            'raised_by': a.created_by, 'source_artifact': a.analysis_report}
+           if a.hypothesis else
+           PLAN.evidence_gap(a.evidence_gap, a.uncertainty, raised_by=a.created_by)
+           if a.evidence_gap else None)
+    report = K.read_json(a.analysis_report) if a.analysis_report else None
+    p = PLAN.plan(
+        plan_id=a.plan_id, question=a.question, uncertainty_ref=unc,
+        why_requested=a.why, dataset_ids=a.dataset_ids, analysis_type=a.analysis_type,
+        tool=a.tool, decision_relevance=a.decision_relevance,
+        parameters_that_may_change=a.parameters or [], created_by=a.created_by,
+        comparison=({'group_column': a.group_column, 'control': a.control,
+                     'treatment': a.treatment_level, 'paired': a.paired, 'covariates': [],
+                     'readouts': a.readouts or [], 'value_column': a.value_column,
+                     'feature_column': a.feature_column, 'options': _options(a.option),
+                     'timepoint': a.timepoint, 'pool_timepoints': a.pool_timepoints or None}
+                    if (a.group_column or a.control or a.value_column or a.option
+                        or a.readouts or a.timepoint or a.pool_timepoints) else None),
+        loop_id=a.loop_id, iteration=a.iteration, analysis_report=report,
+        recorded_gaps=[a.evidence_gap] if a.evidence_gap else ())
+    if a.out:
+        K.write_json_atomic(a.out, p)
+    _print({**p, 'out': a.out})
+    return 0
+
+
+def _options(pairs):
+    """['k=v', ...] -> {k: number | bool | text}, or None."""
+    out = {}
+    for kv in pairs or []:
+        if '=' not in kv:
+            raise K.ContractError(f'--option takes KEY=VALUE, got {kv!r}')
+        k, v = (x.strip() for x in kv.split('=', 1))
+        if v.lower() in ('true', 'false'):
+            out[k] = v.lower() == 'true'
+            continue
+        try:
+            out[k] = int(v) if v.lstrip('-').isdigit() else float(v)
+        except ValueError:
+            out[k] = v
+    return out or None
+
+
+def cmd_analyse_combine(a):
+    from . import combine as CB
+    doc = CB.combine([K.read_json(Path(f)) for f in a.results], a.readouts,
+                     created_by=a.created_by)
+    return _emit(doc, a.out)
+
+
+def cmd_analyse_run(a):
+    from . import execute as EX
+    p = K.read_json(a.plan)
+    r = EX.execute(p, executed_by=a.executed_by, analysis_id=a.analysis_id, out=a.out)
+    if a.out:
+        K.write_text_atomic(Path(a.out).with_suffix('.md'), EX.render(r))
+    _print({'analysis_id': r['analysis_id'], 'evidence_class': r['evidence_class'],
+            'source_evidence_class': r['source_evidence_class'],
+            'source_visibility': r['source_visibility'], 'confidence': r['confidence'],
+            'statistics': r['statistics'], 'key_findings': r['key_findings'],
+            'process_implications': r['process_implications'],
+            'candidate_process_parameters': r['candidate_process_parameters'],
+            'limitations': r['limitations'], 'citable': r['citable'],
+            'out': a.out,
+            'note': 'Candidates only. This result cannot change a protocol; the orchestrator '
+                    'decides, and a revision still has to pass the envelope.'})
+    return 0
+
+
+def cmd_analyse_inspect(a):
+    from . import analyst as AN
+    return _emit(AN.inspect(a.dataset_id), a.out)
+
+
+def cmd_analyse_script(a):
+    from . import analyst as AN
+    doc = AN.run_script(a.script, dataset_ids=a.dataset_ids, question=a.question,
+                        out_dir=a.out_dir, analysis_id=a.analysis_id)
+    _print({k: doc[k] for k in ('analysis_id', 'succeeded', 'problem', 'method', 'findings',
+                                'statistics', 'confidence', 'limitations')}
+           | {'written': str(Path(a.out_dir) / 'agent_analysis.json')})
+    return 0 if doc['succeeded'] else 1
+
+
+def cmd_analyse_interpret(a):
+    from . import analyst as AN
+    if a.template:
+        _print(AN.TEMPLATE)
+        return 0
+    if not (a.draft and a.out):
+        raise K.ContractError('give --draft and --out (or --template to see the shape)')
+    doc = AN.interpret_file(a.draft, a.out)
+    _print({'written': a.out, 'confidence': doc['confidence'],
+            'confidence_claimed': doc['confidence_claimed'],
+            'confidence_capped_by': doc['confidence_capped_by']})
+    return 0
+
+
+def cmd_tools(a):
+    from . import external as EXT
+    from . import registry as TREG
+    d = TREG.describe()
+    d['external_adapters'] = EXT.describe()
+    _print(d)
+    return 0
+
+
+def cmd_sets(a):
+    sets = KB.load_sets(a.knowledge_set)
+    _print({'knowledge_sets': KB.set_manifest(sets),
+            'genes': sorted({g for s in sets for g in s['genes']})})
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='python -m biosense.bioinformatics.cli')
+    sub = ap.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('annotate', help='what the loaded knowledge sets say about a gene perturbation')
+    p.add_argument('--genes', nargs='+', required=True)
+    p.add_argument('--perturbation', default='knockout')
+    p.add_argument('--cell-type')
+    p.add_argument('--knowledge-set', nargs='*')
+    p.add_argument('--protocol', help='cross-check the implicated levers against what this protocol already does per arm')
+    p.add_argument('--loop-id'); p.add_argument('--iteration', type=int)
+    p.add_argument('--question'); p.add_argument('--asked-by')
+    p.add_argument('--out'); p.set_defaults(fn=cmd_annotate)
+    p = sub.add_parser('plan', help='the public queries that would annotate a gene')
+    p.add_argument('--gene', required=True); p.set_defaults(fn=cmd_plan)
+    p = sub.add_parser('live-lookup', help='fetch public annotations (network; off by default)')
+    p.add_argument('--gene', required=True); p.add_argument('--source', nargs='*')
+    p.add_argument('--timeout', type=int, default=20); p.add_argument('--out')
+    p.add_argument('--i-have-network-permission', action='store_true')
+    p.set_defaults(fn=cmd_live_lookup)
+    p = sub.add_parser('gene-info', help='public records per gene: identity, function, GO '
+                                         'process, partners (network)')
+    p.add_argument('--genes', nargs='+', required=True)
+    p.add_argument('--i-have-network-permission', action='store_true')
+    p.add_argument('--out')
+    p.set_defaults(fn=cmd_gene_info)
+    p = sub.add_parser('sets', help='list loaded knowledge sets and their genes')
+    p.add_argument('--knowledge-set', nargs='*'); p.set_defaults(fn=cmd_sets)
+
+    # ── datasets ──────────────────────────────────────────────────────────
+    ds = sub.add_parser('datasets', help='register, list and search datasets').add_subparsers(
+        dest='datasets_command', required=True)
+    p = ds.add_parser('register', help='register a local table as a dataset (private by default)')
+    p.add_argument('--file', required=True)
+    p.add_argument('--dataset-id', required=True)
+    p.add_argument('--title', required=True)
+    p.add_argument('--modality')
+    p.add_argument('--organism', default='Homo sapiens')
+    p.add_argument('--cell-type'); p.add_argument('--perturbation')
+    p.add_argument('--condition-column'); p.add_argument('--control')
+    p.add_argument('--treatment', nargs='*')
+    p.add_argument('--replicate-column'); p.add_argument('--batch-column')
+    p.add_argument('--sample-id-column'); p.add_argument('--donor-column')
+    p.add_argument('--timepoint-column')
+    p.add_argument('--description'); p.add_argument('--registered-by')
+    p.add_argument('--visibility', default='private', choices=('private', 'public'))
+    p.add_argument('--overwrite', action='store_true')
+    p.set_defaults(fn=cmd_datasets_register)
+    p = ds.add_parser('list', help='registered datasets')
+    p.add_argument('--public-only', action='store_true')
+    p.set_defaults(fn=cmd_datasets_list)
+    p = ds.add_parser('show', help='one dataset manifest and its lineage')
+    p.add_argument('--dataset-id', required=True); p.set_defaults(fn=cmd_datasets_show)
+    p = ds.add_parser('from-papers', help='the GEO series the given papers deposited, from '
+                                          'GEO\'s own links and the papers\' text (network)')
+    p.add_argument('--papers', nargs='+', required=True, help='PMID:123 or PMC123, as cited')
+    p.add_argument('--i-have-network-permission', action='store_true')
+    p.add_argument('--out')
+    p.set_defaults(fn=cmd_from_papers)
+    p = ds.add_parser('geo-samples', help='a GEO series\' samples and the fields a condition '
+                                          'can be read from (network)')
+    p.add_argument('--accession', required=True)
+    p.add_argument('--i-have-network-permission', action='store_true')
+    p.add_argument('--out')
+    p.set_defaults(fn=cmd_geo_samples)
+    p = ds.add_parser('fetch-geo', help='a GEO expression series (any species) -> a registered '
+                                        'public dataset (network)')
+    p.add_argument('--accession', required=True)
+    p.add_argument('--condition-key', required=True,
+                   help='a groupable field from geo-samples (a characteristic, title or '
+                        'source), title_label (the title without its replicate number), or '
+                        'a pattern over a field such as "title~(CD43[+-])"')
+    p.add_argument('--control', required=True, nargs='+',
+                   help='the control value; several are pooled as one control, labelled '
+                        'by the first')
+    p.add_argument('--time-key',
+                   help='a field (or title_label, or a pattern) giving each sample\'s '
+                        'timepoint; kept as a timepoint column instead of pooled')
+    p.add_argument('--treatment', nargs='+', required=True)
+    p.add_argument('--keep', nargs='*', default=[], metavar='FIELD=VALUE',
+                   help='keep only samples whose field has this value (e.g. "cell type=macrophage")')
+    p.add_argument('--genes', nargs='*')
+    p.add_argument('--max-genes', type=int, default=2000)
+    p.add_argument('--dataset-id'); p.add_argument('--cell-type')
+    p.add_argument('--supplementary', help='use this series supplementary file name (any '
+                                           'species); for per-sample files, a substring that '
+                                           'picks one where a sample carries several')
+    p.add_argument('--column-map', nargs='*', default=[], metavar='HEADER=GSM',
+                   help='which table column is which sample, when headers are not GSM ids or titles')
+    p.add_argument('--infer-columns', action='store_true',
+                   help='apply confident name-similarity suggestions to columns not matched '
+                        'exactly (recorded with their basis and as a dataset limitation)')
+    p.add_argument('--column-map-basis',
+                   help='why the column map is right (e.g. "series overall design and paper '
+                        'Fig. 1 name MoCul = monocyte culture"); recorded with the dataset')
+    p.add_argument('--i-have-network-permission', action='store_true')
+    p.add_argument('--out')
+    p.set_defaults(fn=cmd_fetch_geo)
+    p = ds.add_parser('fetch-peaks', help='a GEO ChIP-seq / ATAC-seq series\' called peaks -> a '
+                                          'registered peak-set dataset (network)')
+    p.add_argument('--accession', required=True)
+    p.add_argument('--condition-key', help='as for fetch-geo: a field, title_label, or a '
+                                           'pattern such as "title~(KO|WT)"')
+    p.add_argument('--control', required=True, nargs='+')
+    p.add_argument('--treatment', nargs='+', required=True)
+    p.add_argument('--keep', nargs='*', default=[], metavar='FIELD=VALUE')
+    p.add_argument('--replicates', choices=('consensus', 'union'),
+                   help='how to combine several samples of one condition: consensus keeps '
+                        'peaks in at least half of them, union keeps all')
+    p.add_argument('--pick', help='a substring of the file name, where a sample carries '
+                                  'several peak files')
+    p.add_argument('--peak-file', nargs='*', default=[], metavar='CONDITION=FILE',
+                   help='series-level peak files, mapped to conditions explicitly')
+    p.add_argument('--modality', choices=('atac_seq', 'chip_seq'))
+    p.add_argument('--dataset-id'); p.add_argument('--cell-type')
+    p.add_argument('--i-have-network-permission', action='store_true')
+    p.add_argument('--out')
+    p.set_defaults(fn=cmd_fetch_peaks)
+    p = ds.add_parser('register-peaks', help='local BED / narrowPeak / broadPeak files, one per '
+                                             'condition, as a peak-set dataset')
+    p.add_argument('--peaks', nargs='+', required=True, metavar='CONDITION=PATH')
+    p.add_argument('--control', required=True); p.add_argument('--treatment', nargs='+',
+                                                               required=True)
+    p.add_argument('--dataset-id', required=True); p.add_argument('--title', required=True)
+    p.add_argument('--modality', default='atac_seq', choices=('atac_seq', 'chip_seq'))
+    p.add_argument('--organism', default='Homo sapiens'); p.add_argument('--cell-type')
+    p.add_argument('--description'); p.add_argument('--registered-by')
+    p.add_argument('--visibility', default='private', choices=('private', 'public'))
+    p.add_argument('--overwrite', action='store_true')
+    p.set_defaults(fn=cmd_register_peaks)
+    for name, help_ in (('fetch-sc', 'a GEO single-cell series (Matrix Market counts, genes, '
+                                     'cells) -> a per-sample pseudobulk with its time axis '
+                                     '(network)'),
+                        ('pseudobulk', 'local single-cell files -> a per-sample pseudobulk, '
+                                       'registered privately')):
+        p = ds.add_parser(name, help=help_)
+        if name == 'fetch-sc':
+            p.add_argument('--accession', required=True)
+            p.add_argument('--i-have-network-permission', action='store_true')
+        else:
+            p.add_argument('--title', required=True)
+            p.add_argument('--registered-by'); p.add_argument('--overwrite', action='store_true')
+        p.add_argument('--matrix', required=True,
+                       help='the Matrix Market count file (series file name, or a local path)')
+        p.add_argument('--features', required=True, help='genes, in matrix order')
+        p.add_argument('--cells', required=True, help='the cell annotation table')
+        p.add_argument('--barcodes', help='cell ids in matrix order (10x barcodes.tsv)')
+        p.add_argument('--cells-in-matrix-order', action='store_true',
+                       help='the cell table\'s rows are in matrix order (no barcodes file)')
+        p.add_argument('--cell-id-column', help='the cell table column holding the barcodes')
+        p.add_argument('--feature-name-column', help='for a features table with a header')
+        p.add_argument('--sample-column', required=True,
+                       help='the cell table column naming each cell\'s sample (the unit)')
+        p.add_argument('--condition-column', required=True)
+        p.add_argument('--control', required=True, nargs='+')
+        p.add_argument('--treatment', nargs='+', required=True)
+        p.add_argument('--time-column', help='the cell table column giving each sample\'s '
+                                             'timepoint; kept as a time axis')
+        p.add_argument('--cell-type-column',
+                       help='the depositors\' annotation column, to sum one population only')
+        p.add_argument('--population', nargs='*',
+                       help='which annotated population(s) to sum (needs --cell-type-column)')
+        p.add_argument('--genes', nargs='*'); p.add_argument('--max-genes', type=int,
+                                                             default=2000)
+        p.add_argument('--min-cells', type=int,
+                       help='drop a sample with fewer cells than this (default 20)')
+        p.add_argument('--dataset-id', required=(name == 'pseudobulk'))
+        p.add_argument('--organism', default='Homo sapiens'); p.add_argument('--cell-type')
+        p.add_argument('--out')
+        p.set_defaults(fn=cmd_fetch_sc if name == 'fetch-sc' else cmd_pseudobulk)
+    p = ds.add_parser('register-h5ad', help='a local .h5ad as a single-cell dataset (needs the '
+                                            'singlecell extra)')
+    p.add_argument('--file', required=True); p.add_argument('--dataset-id', required=True)
+    p.add_argument('--title', required=True)
+    p.add_argument('--condition-column'); p.add_argument('--control')
+    p.add_argument('--treatment', nargs='*'); p.add_argument('--sample-id-column')
+    p.add_argument('--timepoint-column'); p.add_argument('--donor-column')
+    p.add_argument('--organism', default='Homo sapiens'); p.add_argument('--cell-type')
+    p.add_argument('--registered-by')
+    p.add_argument('--visibility', default='private', choices=('private', 'public'))
+    p.add_argument('--overwrite', action='store_true')
+    p.set_defaults(fn=cmd_register_h5ad)
+    p = ds.add_parser('fetch-genesets', help='download an openly licensed gene-set library '
+                                             '(reactome, go_bp) for pathway enrichment (network)')
+    p.add_argument('--library', required=True)
+    p.add_argument('--i-have-network-permission', action='store_true')
+    p.set_defaults(fn=cmd_fetch_genesets)
+    p = ds.add_parser('add-genesets', help='add your own gene-set library from a GMT file')
+    p.add_argument('--file', required=True); p.add_argument('--name', required=True)
+    p.add_argument('--license', required=True); p.add_argument('--added-by')
+    p.set_defaults(fn=cmd_add_genesets)
+    p = ds.add_parser('genesets', help='gene-set libraries stored here, and those that can be '
+                                       'fetched')
+    p.set_defaults(fn=cmd_genesets)
+    p = ds.add_parser('search', help='find candidate datasets (offline by default)')
+    p.add_argument('--query', required=True)
+    p.add_argument('--source', default='geo')
+    p.add_argument('--organism'); p.add_argument('--modality')
+    p.add_argument('--cell-type'); p.add_argument('--perturbation')
+    p.add_argument('--limit', type=int, default=10)
+    p.add_argument('--live', action='store_true')
+    p.add_argument('--i-have-network-permission', action='store_true')
+    p.set_defaults(fn=cmd_datasets_search)
+
+    # ── analysis ──────────────────────────────────────────────────────────
+    an = sub.add_parser('analyse', help='plan and run an analysis').add_subparsers(
+        dest='analyse_command', required=True)
+    p = an.add_parser('plan', help='write an AnalysisPlan against a named uncertainty')
+    p.add_argument('--plan-id', required=True)
+    p.add_argument('--question', required=True)
+    p.add_argument('--hypothesis', help='hypothesis_id from an analysis report')
+    p.add_argument('--evidence-gap', help='identifier for a recorded evidence gap')
+    p.add_argument('--uncertainty', required=True, help='what is not known, in words')
+    p.add_argument('--analysis-report', help='the report the hypothesis comes from')
+    p.add_argument('--why', required=True, help='why ask now rather than revise or stop')
+    p.add_argument('--dataset-ids', nargs='+', required=True)
+    p.add_argument('--analysis-type', required=True)
+    p.add_argument('--tool', required=True)
+    p.add_argument('--decision-relevance', required=True)
+    p.add_argument('--parameters', nargs='*')
+    p.add_argument('--group-column'); p.add_argument('--control')
+    p.add_argument('--treatment-level'); p.add_argument('--paired', action='store_true')
+    p.add_argument('--readouts', nargs='*')
+    p.add_argument('--option', action='append', default=[], metavar='KEY=VALUE',
+                   help='a tool-specific setting (see the tool in `tools`), recorded with the '
+                        'result; repeat for several')
+    p.add_argument('--value-column', help='the measured column, when its name is not a usual one')
+    p.add_argument('--feature-column', help='the gene/feature column, when its name is not a usual one')
+    p.add_argument('--timepoint', help='for a dataset with a time axis: the one timepoint to '
+                                       'compare at (e.g. "day 2")')
+    p.add_argument('--pool-timepoints', action='store_true',
+                   help='compare across every timepoint as one; the result states it')
+    p.add_argument('--created-by', default='bioinformatics_agent')
+    p.add_argument('--loop-id'); p.add_argument('--iteration', type=int)
+    p.add_argument('--out'); p.set_defaults(fn=cmd_analyse_plan)
+    p = an.add_parser('combine', help='pool one readout across several analysis results '
+                                       '(random effects, heterogeneity reported)')
+    p.add_argument('--results', nargs='+', required=True)
+    p.add_argument('--readouts', nargs='+', required=True,
+                   help='gene symbols, or "gene set score" for a set score')
+    p.add_argument('--created-by', default='bioinformatics_agent')
+    p.add_argument('--out'); p.set_defaults(fn=cmd_analyse_combine)
+    p = an.add_parser('run', help='execute a plan and write the AnalysisResult')
+    p.add_argument('--plan', required=True)
+    p.add_argument('--analysis-id'); p.add_argument('--executed-by', default='bioinformatics_agent')
+    p.add_argument('--out'); p.set_defaults(fn=cmd_analyse_run)
+
+    p = an.add_parser('inspect', help='a dataset\'s columns, groups and the plan arguments '
+                                      'that fit it')
+    p.add_argument('--dataset-id', required=True)
+    p.add_argument('--out'); p.set_defaults(fn=cmd_analyse_inspect)
+    p = an.add_parser('script', help='run an agent-written analysis script, labelled as such')
+    p.add_argument('--script', required=True)
+    p.add_argument('--dataset-ids', nargs='+', required=True)
+    p.add_argument('--question', required=True)
+    p.add_argument('--out-dir', required=True)
+    p.add_argument('--analysis-id')
+    p.set_defaults(fn=cmd_analyse_script)
+    p = an.add_parser('interpret', help='check an interpretation and cap its confidence')
+    p.add_argument('--draft'); p.add_argument('--out')
+    p.add_argument('--template', action='store_true', help='print the draft shape')
+    p.set_defaults(fn=cmd_analyse_interpret)
+
+    p = sub.add_parser('tools', help='the analysis tool registry and external adapters')
+    p.set_defaults(fn=cmd_tools)
+    a = ap.parse_args(argv)
+    try:
+        return a.fn(a)
+    except (K.ContractError, ValueError, KeyError, OSError) as e:
+        # A KeyError's own text is just the quoted key, which reached a person
+        # as the whole of a limitation: "'genotype_arms'".
+        msg = (f'an input file is missing the field {e}, which this command needs'
+               if isinstance(e, KeyError) else str(e))
+        _print({'error': type(e).__name__, 'message': msg})
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

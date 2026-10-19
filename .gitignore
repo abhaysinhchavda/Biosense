@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+/runs/*
+!/runs/.gitkeep
+.pytest_cache/
+.ruff_cache/
+BioSenseAI.pdf
+file.pdf
+*Outcome_Blueprint.md
+.DS_Store
+
+# Private user datasets. Nothing a person ingests is ever committed.
+# The directory itself is tracked only through its .gitkeep so the default
+# private root exists on a fresh clone; everything inside it is ignored.
+/private_data/*
+!/private_data/.gitkeep
+# Cached public dataset downloads. Reproducible from the accession, so the
+# manifest is the artifact worth keeping, not the payload.
+/data_cache/
+
+# Benchmarks a visitor built from a web run. They belong beside their run, not
+# in the project's committed public set.
+benchmarks/public/disc_*/
+.local-ai/

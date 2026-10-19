@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BioSense Data</title>
+<meta name="description" content="What data this machine can analyse, which analyses can actually run, and which processes BioSense knows how to tune.">
+<link rel="icon" type="image/png" href="assets/biosense-mark.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="brand.css">
+<style>
+.wrap{display:flex;flex-direction:column;gap:20px}
+.card{padding:20px 22px}
+.caveat{font-size:12.5px;line-height:1.55;color:var(--ink-3);margin:12px 0 0;max-width:74ch}
+.head{display:flex;align-items:baseline;gap:12px;margin:0 0 4px}
+.head h2{font-size:15px;margin:0;letter-spacing:-.01em}
+.sub{font-size:12.5px;color:var(--ink-3);margin:0 0 14px;max-width:74ch;line-height:1.55}
+
+.row{display:flex;gap:10px;align-items:flex-start;padding:12px 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}
+.row .main{flex:1;min-width:0}
+.row .nm{font-weight:600;font-size:14px}
+.row .meta{font-size:12.5px;color:var(--ink-3);margin-top:3px;line-height:1.5}
+
+.tag{font-family:var(--mono);font-size:10.5px;font-weight:600;letter-spacing:.08em;
+  text-transform:uppercase;padding:4px 9px;border-radius:999px;white-space:nowrap;
+  border:1px solid var(--line);color:var(--ink-3)}
+.tag.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 42%,transparent);
+  background:color-mix(in srgb,var(--ok) 10%,transparent)}
+.tag.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 42%,transparent);
+  background:color-mix(in srgb,var(--warn) 10%,transparent)}
+.tag.off{opacity:.75;border-style:dashed}
+.tags{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+
+/* a knob the project owns but the model has no term for. Deliberately not red:
+   it is a real design variable, it simply gets no prediction. */
+.knob{display:flex;justify-content:space-between;gap:10px;padding:7px 0;
+  border-top:1px dotted var(--line);font-size:13px}
+.knob:first-child{border-top:0}
+.knob .rng{font-family:var(--mono);font-size:12px;color:var(--ink-3);
+  font-variant-numeric:tabular-nums}
+.knob .why{font-size:12px;color:var(--ink-3);margin:2px 0 0;line-height:1.5}
+.proj{border:1px solid var(--line);border-radius:var(--r-s);padding:14px 16px;margin-top:12px}
+.proj h3{margin:0 0 2px;font-size:14px}
+
+/* ids, mappings, bound origins: kept in the markup, not shown */
+body[data-view="simple"] .tech{display:none}
+.tech{font-family:var(--mono);font-size:11.5px;color:var(--ink-3)}
+.dim{color:var(--ink-3)}
+</style>
+</head>
+<body data-view="simple">
+<div class="wrap">
+
+<header class="bar">
+  <div class="brand">
+    <img src="assets/biosense-mark.png" alt="">
+    <div>
+      <div class="nm">BioSense<span>AI</span></div>
+      <div class="sub">What this machine can analyse</div>
+    </div>
+  </div>
+  <nav class="modes" aria-label="Section">
+    <a href="console.html">AI Discovery</a>
+    <a href="runs.html">Runs</a>
+    <a href="simulator.html">Simulator</a>
+    <a href="data.html" aria-current="page">Data</a>
+    <a href="loop.html">Quick loop</a>
+    <a href="index.html">Loop tracker</a>
+  </nav>
+  <span id="runbeacon" hidden></span>
+  <div class="spacer"></div>
+  <button class="btn" id="theme" title="Switch light / dark">Theme</button>
+</header>
+
+
+
+  <!-- The landscape every run starts from: papers on making cells, each read for
+       the values it states, with the sentence that states them. Built by a
+       literature run an admin starts here; searched by every later run. -->
+  <section class="glass card" id="libCard">
+    <div class="head"><h2>Cell production library</h2><span class="dim" id="libCount"></span></div>
+    <p class="sub">What the literature reports about producing cells from iPSC — expansion,
+      embryoid bodies and aggregates, differentiation, maturation, scale-up and harvest — read
+      once and kept on this server. Every run starts its literature search here and looks
+      only for what the library lacks. Each value keeps the sentence it came from; a value
+      about a neighbouring quantity (EBs per well rather than cells per mL) is marked as a
+      proxy with its conversion.</p>
+    <div id="libBuild" hidden>
+      <form id="libForm" class="upform">
+        <label>Project to carry the run <select id="libProject"></select></label>
+        <label>Scope <select id="libScope">
+          <option value="general" selected>general — the whole field, for any project</option>
+          <option value="project">project-specific — this project's biology</option></select></label>
+        <label>Depth <select id="libEffort">
+          <option value="standard">standard — about 40 minutes</option>
+          <option value="thorough" selected>thorough — more papers, longer</option></select></label>
+        <label style="grid-column:1/-1">Focus (optional)
+          <input type="text" id="libFocus" maxlength="300"
+            placeholder="e.g. myeloid and macrophage production; stirred bioreactors"></label>
+        <button class="btn go" type="submit" id="libGo">Build the library</button>
+      </form>
+      <p class="dim" id="libMsg"></p>
+    </div>
+    <div class="libsearch"><input type="search" id="libQ"
+      placeholder="Search the library — e.g. embryoid body density, M-CSF, agitation"></div>
+    <div id="libMatches"></div>
+    <div id="libPapers" class="dim">loading…</div>
+  </section>
+
+  <section class="glass card">
+    <div class="head"><h2>Datasets</h2><span class="dim" id="dsCount"></span></div>
+    <p class="sub">Registered data this server can see. Datasets someone registered privately
+      are never listed or served here: they stay on the machine that holds them and are
+      reachable only from the command line there.</p>
+    <div id="datasets" class="dim">loading…</div>
+  </section>
+
+  <!-- Adding a processed table. An operator's action: it writes to this server's
+       volume, the dataset stays PRIVATE, and it is never listed here — the page
+       remembers what you uploaded, in your own browser, so you can name it in a run. -->
+  <section class="glass card" id="uploadCard">
+    <div class="head"><h2>Add a dataset</h2><span class="dim">admin · private</span></div>
+    <p class="sub">A processed table (.csv or .tsv): one row per sample or population, a column
+      that says which condition each row belongs to, and the readouts. It is registered
+      privately on this server and the bioinformatics agent can analyse it when a run names it.
+      It is never served over HTTP and never becomes a literature citation.</p>
+    <form id="uploadForm" class="upform">
+      <label>File <input type="file" id="upFile" accept=".csv,.tsv,.txt" required></label>
+      <label>Dataset id <input type="text" id="upId" placeholder="e.g. my-macrophage-gmcsf-2026"
+        pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,63}" required></label>
+      <label>Title <input type="text" id="upTitle" placeholder="What this table is"></label>
+      <label>Kind of data
+        <select id="upModality">
+          <option value="">detect from the table</option>
+          <option value="cytometry_summary">flow-cytometry populations (processed)</option>
+          <option value="bulk_rna">bulk expression (normalised)</option>
+        </select></label>
+      <label>Condition column <input type="text" id="upCond" placeholder="e.g. condition"></label>
+      <label>Control level <input type="text" id="upControl" placeholder="e.g. M-CSF only"></label>
+      <label>Replicate column <input type="text" id="upRep" placeholder="optional"></label>
+      <label>Cell type <input type="text" id="upCell" placeholder="optional, e.g. iPSC-derived macrophage"></label>
+      <button class="btn go" type="submit" id="upGo">Add dataset</button>
+    </form>
+    <div id="upResult"></div>
+    <div id="myUploads"></div>
+  </section>
+
+  <section class="glass card">
+    <div class="head"><h2>Analyses that can run</h2><span class="dim" id="toolCount"></span></div>
+    <p class="sub">A tool that cannot run here is not offered. That is deliberate: an analysis
+      refused while it is being planned is a decision you can act on, and one that fails
+      half-way through a run is a wasted afternoon.</p>
+    <div id="tools" class="dim">loading…</div>
+    <div id="planned"></div>
+  </section>
+
+  <section class="glass card">
+    <div class="head"><h2>Processes BioSense knows</h2><span class="dim" id="projCount"></span></div>
+    <p class="sub">Each process exposes the knobs it actually has, with its own limits. A
+      parameter marked <b>not modelled</b> is still a real design variable you can set in the
+      lab — the model simply has no term for it, so it produces no prediction for it, rather
+      than a number that would be invented.</p>
+    <div id="projects" class="dim">loading…</div>
+  </section>
+
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+
+/* theme: the same remembered preference the other pages use */
+(function () {
+  let saved = null; try { saved = localStorage.getItem('bs-theme'); } catch (_) {}
+  if (saved) document.documentElement.setAttribute('data-theme', saved);
+  $('#theme').addEventListener('click', () => {
+    const cur = document.documentElement.getAttribute('data-theme')
+      || (matchMedia('(prefers-color-scheme:dark)').matches ? 'dark' : 'light');
+    const next = cur === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem('bs-theme', next); } catch (_) {}
+  });
+})();
+
+const el = (t, c, x) => { const n = document.createElement(t); if (c) n.className = c;
+  if (x != null) n.textContent = x; return n; };
+const tag = (text, cls) => el('span', 'tag' + (cls ? ' ' + cls : ''), text);
+const num = n => (n == null ? '—' : (+n).toLocaleString());
+
+async function get(p) { const r = await fetch(p); if (!r.ok) throw new Error(p); return r.json(); }
+
+function row(name, meta, tags, techLine) {
+  const r = el('div', 'row'), m = el('div', 'main');
+  m.append(el('div', 'nm', name));
+  if (meta) m.append(el('div', 'meta', meta));
+  if (techLine) m.append(Object.assign(el('div', 'meta tech', techLine), {}));
+  const t = el('div', 'tags');
+  (tags || []).forEach(([txt, cls]) => t.append(tag(txt, cls)));
+  r.append(m, t);
+  return r;
+}
+
+async function datasets() {
+  const host = $('#datasets');
+  try {
+    const d = await get('/api/datasets');
+    host.textContent = '';
+    $('#dsCount').textContent = d.datasets.length + ' registered';
+    if (!d.datasets.length) host.append(el('p', 'dim', 'Nothing registered on this machine yet.'));
+    d.datasets.forEach(x => host.append(row(
+      x.title || x.dataset_id,
+      [x.modality, x.cell_type, x.n_rows != null ? num(x.n_rows) + ' rows' : null]
+        .filter(Boolean).join(' · '),
+      [[x.visibility || 'public', x.visibility === 'private' ? 'warn' : 'ok']],
+      x.dataset_id + (x.sha256 ? '  sha256:' + x.sha256.slice(0, 12) : ''))));
+    host.append(Object.assign(el('p', 'caveat', d.note), {}));
+  } catch (_) { host.textContent = 'the data service did not answer'; }
+}
+
+async function tools() {
+  const host = $('#tools'), host2 = $('#planned');
+  try {
+    const d = await get('/api/analysis-tools');
+    host.textContent = ''; host2.textContent = '';
+    $('#toolCount').textContent = d.implemented.length + ' available here';
+    d.implemented.forEach(t => host.append(row(
+      t.label, t.notes,
+      [['runs here', 'ok'], ...(t.external_dependency ? [[t.external_dependency, '']] : [])],
+      t.name + '  ·  ' + (t.modalities || []).join(', '))));
+
+    if (d.planned.length) {
+      const h = el('div', 'head'); h.style.margin = '22px 0 4px';
+      h.append(el('h2', null, 'Not available here'));
+      host2.append(h);
+      host2.append(el('p', 'sub', 'Named so the shape of what is coming is visible. Asking for '
+        + 'one of these is refused, with the reason and, where there is one, the remedy.'));
+      d.planned.forEach(p => host2.append(row(
+        p.label, p.notes,
+        [[{ planned: 'not written yet', optional_environment: 'needs an install',
+            external_binary: 'needs a program', phase_2: 'available' }[p.status] || p.status,
+          p.status === 'planned' ? 'off' : 'warn']],
+        p.name)));
+    }
+  } catch (_) { host.textContent = 'the tool registry did not answer'; }
+}
+
+async function projects() {
+  const host = $('#projects');
+  try {
+    const d = await get('/api/projects');
+    host.textContent = '';
+    $('#projCount').textContent = d.projects.length + ' known';
+    d.projects.forEach(p => {
+      const box = el('div', 'proj');
+      box.append(el('h3', null, p.name));
+      const bio = p.biological_system || {};
+      box.append(el('p', 'meta', [bio.species, bio.starting_cell && ('from ' + bio.starting_cell),
+        bio.target_cell && ('to ' + bio.target_cell), bio.culture_format]
+        .filter(Boolean).join(' · ')));
+      const t = el('div', 'tags'); t.style.margin = '8px 0 10px';
+      t.append(tag(p.parameters.length + ' knobs'));
+      t.append(p.has_simulator
+        ? tag(p.modelled_parameter_ids.length + ' modelled', 'ok')
+        : tag('no simulator', 'off'));
+      box.append(t);
+      p.parameters.forEach(q => {
+        const k = el('div', 'knob'), left = el('div');
+        left.append(el('span', null, q.label || q.parameter_id));
+        if (q.simulator_coverage !== 'modelled') {
+          left.append(document.createTextNode(' '));
+          left.append(tag(q.simulator_coverage.replace(/_/g, ' '), 'off'));
+        }
+        left.append(el('p', 'why tech', q.parameter_id
+          + (q.simulator_mapping ? '  →  model knob ' + q.simulator_mapping : '')));
+        if (q.bound_origin) {
+          left.append(el('p', 'why tech',
+            'limits from ' + q.bound_origin.source.replace(/_/g, ' ') + ': ' + q.bound_origin.basis));
+        }
+        const r = el('span', 'rng', num(q.minimum) + ' – ' + num(q.maximum) +
+          (q.unit ? ' ' + q.unit : ''));
+        k.append(left, r);
+        box.append(k);
+      });
+      host.append(box);
+    });
+    host.append(Object.assign(el('p', 'caveat', d.note), {}));
+  } catch (_) { host.textContent = 'the project service did not answer'; }
+}
+
+/* Uploads are remembered in this browser only: the server never lists a
+   private dataset, to anyone. */
+const UPLOADS_KEY = 'biosense.uploads';
+function myUploads() {
+  try { return JSON.parse(localStorage.getItem(UPLOADS_KEY) || '[]'); } catch (_) { return []; }
+}
+function rememberUpload(d) {
+  const list = myUploads().filter(x => x.dataset_id !== d.dataset_id);
+  list.unshift({ dataset_id: d.dataset_id, title: d.title, modality: d.modality,
+    conditions: d.conditions, at: Date.now() });
+  try { localStorage.setItem(UPLOADS_KEY, JSON.stringify(list.slice(0, 40))); } catch (_) {}
+}
+function renderMyUploads() {
+  const host = $('#myUploads'); host.textContent = '';
+  const list = myUploads();
+  if (!list.length) return;
+  host.append(el('div', 'lab', 'Your uploads (remembered in this browser)'));
+  list.forEach(u => {
+    const row = el('div', 'm');
+    row.append(el('code', null, u.dataset_id), ' — ' + (u.title || ''),
+      el('span', 'dim', `  ${u.modality || ''}${(u.conditions || []).length ? ' · ' + u.conditions.join(', ') : ''}`));
+    host.append(row);
+  });
+  host.append(el('p', 'dim', 'They appear as choices in the AI Discovery form under "Datasets".'));
+}
+$('#uploadForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const out = $('#upResult'); out.textContent = '';
+  const f = $('#upFile').files[0];
+  if (!f) return;
+  if (f.size > 12 * 1024 * 1024) { out.append(el('p', 'bad', 'Larger than 12 MB: register it from the command line.')); return; }
+  const go = $('#upGo'); go.disabled = true; go.textContent = 'adding…';
+  try {
+    const body = { file_name: f.name, content: await f.text(), dataset_id: $('#upId').value.trim(),
+      title: $('#upTitle').value.trim(), modality: $('#upModality').value || null,
+      condition_column: $('#upCond').value.trim(), control: $('#upControl').value.trim(),
+      replicate_column: $('#upRep').value.trim(), cell_type: $('#upCell').value.trim() };
+    const r = await fetch('/api/datasets/upload', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || `the server answered ${r.status}`);
+    rememberUpload(d.dataset);
+    out.append(el('p', 'ok', `Added ${d.dataset.dataset_id} (${d.dataset.modality}, `
+      + `${d.dataset.sample_count ?? '?'} rows).`), el('p', 'dim', d.note));
+    if ((d.dataset.missing_metadata || []).length) {
+      out.append(el('p', 'caveat', 'Missing metadata: ' + d.dataset.missing_metadata.join(', ')
+        + '. Analyses that need it will say so.'));
+    }
+    renderMyUploads();
+    $('#uploadForm').reset();
+  } catch (e) {
+    out.append(el('p', 'bad', e.message));
+  } finally { go.disabled = false; go.textContent = 'Add dataset'; }
+});
+renderMyUploads();
+
+/* ── the cell production library ─────────────────────────── */
+const fmtVal = v => (v.value != null ? (+v.value).toLocaleString()
+  : [v.low, v.high].filter(x => x != null).map(x => (+x).toLocaleString()).join('–'))
+  + (v.unit ? ' ' + v.unit : '');
+function valueLine(v) {
+  const li = el('li');
+  li.append(el('b', null, v.parameter + ': '), document.createTextNode(fmtVal(v) + ' · ' + v.stage));
+  if (v.proxy_for) li.append(' ', tag('proxy for ' + v.proxy_for, 'warn'));
+  if (v.context) li.append(el('div', 'dim', v.context));
+  if (v.conversion) li.append(el('div', 'dim', 'conversion: ' + v.conversion));
+  li.append(el('div', 'quote', '“' + v.quote + '”' + (v.locator ? ' — ' + v.locator : '')));
+  return li;
+}
+function paperLink(id) {
+  const a = el('a', null, id); a.target = '_blank'; a.rel = 'noopener';
+  a.href = id.startsWith('PMC') ? `https://europepmc.org/article/PMC/${id}`
+    : id.startsWith('PMID:') ? `https://pubmed.ncbi.nlm.nih.gov/${id.slice(5)}/`
+    : `https://doi.org/${id.replace(/^doi:/i, '')}`;
+  return a;
+}
+async function library(q) {
+  const host = $('#libPapers');
+  try {
+    const d = await get('/api/library' + (q ? '?q=' + encodeURIComponent(q) : ''));
+    const s = d.stats;
+    $('#libCount').textContent = s.papers ? `${s.papers} papers · ${s.values} values` : 'empty';
+    $('#libBuild').hidden = !d.can_build;
+    const mh = $('#libMatches'); mh.textContent = '';
+    if (q) {
+      const ul = el('ul', 'libvals');
+      (d.matches || []).forEach(v => {
+        const li = valueLine(v);
+        li.prepend(paperLink(v.paper_id), ' ');
+        ul.append(li);
+      });
+      mh.append(el('p', 'dim', (d.matches || []).length ? `Values mentioning “${q}”:` : `Nothing mentions “${q}”.`), ul);
+    }
+    host.textContent = '';
+    if (!d.papers.length) {
+      host.append(el('p', 'dim', d.can_build
+        ? 'Empty. Build it once above; every later run starts from it.'
+        : 'Empty. An admin builds it from this page.'));
+      return;
+    }
+    d.papers.forEach(p => {
+      const det = el('details', 'libpaper');
+      const sum = el('summary');
+      sum.append(el('b', null, p.title), ' ',
+        el('span', 'dim', [p.year, (p.system || {}).cells, (p.system || {}).format]
+          .filter(Boolean).join(' · ') + ` · ${p.n_values} values`));
+      det.append(sum);
+      const meta = el('p', 'dim'); meta.append(paperLink(p.paper_id), ' · ' + (p.stages || []).join(', '));
+      det.append(meta);
+      if (p.summary) det.append(el('p', null, p.summary));
+      const ul = el('ul', 'libvals'); (p.values || []).forEach(v => ul.append(valueLine(v)));
+      det.append(ul);
+      host.append(det);
+    });
+  } catch (_) { host.textContent = 'the library did not answer'; }
+}
+let libTimer = null;
+$('#libQ').addEventListener('input', e => {
+  clearTimeout(libTimer); libTimer = setTimeout(() => library(e.target.value.trim()), 300);
+});
+(async function libProjects() {
+  try {
+    /* The person's own projects first, then the shipped templates — the same
+       listing the Discovery page offers, because the run is carried by
+       whichever project it is started from and the library it builds is
+       shared by every project on this server. */
+    const d = await get('/api/workspace/projects');
+    const sel = $('#libProject');
+    (d.projects || []).sort((a, b) =>
+      (a.source === 'workspace' ? 0 : 1) - (b.source === 'workspace' ? 0 : 1))
+      .forEach(p => {
+        const o = el('option', null,
+          p.name + (p.source === 'workspace' ? ' — yours' : ' — template'));
+        o.value = p.project_id; sel.append(o);
+      });
+  } catch (_) { /* the build form says so on submit */ }
+})();
+$('#libForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const go = $('#libGo'), msg = $('#libMsg');
+  go.disabled = true; msg.textContent = 'starting…';
+  let focus = $('#libFocus').value.trim();
+  if ($('#libScope').value === 'project') {
+    /* A project-specific build is the same landscape run, steered: the focus
+       names this project's biology so the searches weight its cells, lineage
+       and format. The library it fills stays shared either way. */
+    try {
+      const pd = await get('/api/projects/' + encodeURIComponent($('#libProject').value));
+      const b = (pd.project && pd.project.biological_system) || {};
+      const bits = [b.species, b.starting_cell, b.target_cell, b.culture_format]
+        .filter(x => x && x !== 'unspecified');
+      focus = pd.project.name + (bits.length ? ' (' + bits.join(', ') + ')' : '')
+        + (focus ? '; ' + focus : '');
+    } catch (_) { /* no detail answered: run it general */ }
+  }
+  try {
+    const r = await fetch('/api/discovery', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: $('#libProject').value, purpose: 'landscape',
+        effort: $('#libEffort').value,
+        objective: 'Build the cell production library: what the literature reports about producing '
+          + 'cells from iPSC across expansion, aggregates and embryoid bodies, differentiation, '
+          + 'maturation, scale-up and harvest' + (focus ? '. Focus: ' + focus : '.') }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || `the server answered ${r.status}`);
+    try { localStorage.setItem('bs-last-discovery-run', d.run_id); } catch (_) {}
+    msg.textContent = '';
+    msg.append('Started. ', Object.assign(el('a', null, 'Watch it in AI Discovery'), { href: 'console.html' }),
+      ' — the papers appear here when it finishes.');
+  } catch (e) { msg.textContent = e.message; go.disabled = false; }
+});
+
+library(); datasets(); tools(); projects();
+</script>
+<script src="runstate.js"></script>
+<script>mountRunBeacon();</script>
+</body>
+</html>

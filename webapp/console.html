@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BioSense · AI Discovery</title>
+<meta name="description" content="Pick a project, state a scientific objective, choose a runtime, and watch BioSense gather evidence, analyse data, form a quantified hypothesis and recommend a protocol.">
+<link rel="icon" type="image/png" href="assets/biosense-mark.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="brand.css">
+<style>
+/* Page-specific layout only. Everything reusable lives in brand.css so the
+   simulator, the data page and this one cannot drift apart. */
+.cols{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(0,1fr);gap:20px;
+  align-items:start;margin-top:4px}
+@media (max-width:64rem){.cols{grid-template-columns:1fr}}
+/* A grid column's content must not be wider than the column: without this a
+   long unbreakable line widened a card under its neighbour. */
+.cols > *, .stack > *{min-width:0}
+.stack{display:flex;flex-direction:column;gap:20px;min-width:0}
+.card{padding:20px 22px}
+.card > .head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+  flex-wrap:wrap;margin-bottom:14px}
+.card h3{font-size:16.5px}
+.card .hint{font-size:13.5px;color:var(--ink-3);font-weight:400;letter-spacing:0}
+.caveat{font-size:12.5px;line-height:1.55;color:var(--ink-3);margin:12px 0 0;max-width:70ch}
+.lab{font-size:11px;font-family:var(--mono);letter-spacing:.07em;text-transform:uppercase;
+  color:var(--ink-3);margin:14px 0 4px}
+textarea{width:100%;min-height:104px;resize:vertical;font-family:var(--sans);font-size:17px;
+  line-height:1.55;padding:13px 15px;border-radius:12px;border:1px solid var(--line);
+  background:var(--glass-2);color:var(--ink)}
+textarea:focus{outline:none;border-color:var(--brand);
+  box-shadow:0 0 0 4px color-mix(in srgb,var(--brand) 16%,transparent)}
+.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:16px}
+.flag{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.09em;
+  text-transform:uppercase;padding:5px 10px;border-radius:999px;color:var(--warn);
+  border:1px solid color-mix(in srgb,var(--warn) 42%,transparent);
+  background:color-mix(in srgb,var(--warn) 10%,transparent)}
+.feed{max-height:22rem;overflow:auto;font-size:14px;scrollbar-width:thin}
+.ev{display:grid;grid-template-columns:3.2rem 1fr;gap:10px;padding:8px 0;
+  border-bottom:1px solid var(--line)}
+.ev:last-child{border-bottom:0}
+.ev .t{font-family:var(--mono);font-size:11px;color:var(--ink-3);padding-top:2px;
+  font-variant-numeric:tabular-nums}
+.ev .d{min-width:0;overflow-wrap:anywhere;line-height:1.5}
+.k{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.09em;
+  text-transform:uppercase;padding:2px 7px;border-radius:6px;display:inline-block;
+  margin-right:7px;white-space:nowrap;border:1px solid var(--line);color:var(--ink-3)}
+/* Raw ids and tool lines stay out of the page view; the downloads keep them. */
+body[data-view="simple"] .tech{display:none}
+.tech{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:3px}
+.hyp{border:1px solid var(--line);border-radius:var(--r-s);padding:14px 16px;margin-bottom:12px}
+.hyp h4{margin:0 0 6px;font-size:14.5px;line-height:1.4}
+.hyp .move{font-family:var(--mono);font-size:13.5px;margin:9px 0;color:var(--ink)}
+.hyp .move b{color:var(--brand)}
+.hyp .m{font-size:12.5px;color:var(--ink-3);margin:2px 0 8px}
+.eff{display:flex;justify-content:space-between;gap:10px;align-items:baseline;padding:6px 0;
+  border-top:1px dotted var(--line);font-size:13.5px}
+.eff .amt{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap;
+  display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.eff .rel{color:var(--ink-3);font-size:12px}
+.et{font-family:var(--mono);font-size:9.5px;font-weight:700;letter-spacing:.09em;
+  text-transform:uppercase;padding:2px 6px;border-radius:4px;border:1px solid var(--line);
+  color:var(--ink-3);white-space:nowrap}
+.et.measured,.et.derived{color:var(--ok);
+  border-color:color-mix(in srgb,var(--ok) 40%,transparent)}
+.et.simulated,.et.predicted{color:var(--warn);
+  border-color:color-mix(in srgb,var(--warn) 45%,transparent)}
+.et.target{border-style:dashed}
+.hev{display:flex;gap:8px;align-items:flex-start;padding:6px 0;font-size:12.5px;
+  border-top:1px dotted var(--line)}
+.hev .cls{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.07em;
+  text-transform:uppercase;padding:3px 7px;border-radius:999px;white-space:nowrap;
+  border:1px solid var(--line);color:var(--ink-3)}
+details{margin-top:12px}
+summary{cursor:pointer;font-family:var(--mono);font-size:12.5px;color:var(--brand)}
+ul.tight{margin:7px 0;padding-left:20px} ul.tight li{margin:4px 0}
+.export{display:flex;flex-direction:column;gap:8px;margin-top:4px}
+.export .btn{justify-content:center;text-align:center;text-decoration:none}
+.export .note{font-size:12.5px;color:var(--ink-3);line-height:1.45}
+.fold > .head{cursor:pointer;user-select:none;margin-bottom:0}
+.fold[data-open="1"] > .head{margin-bottom:14px}
+.fold > .head h3::before{content:"\25B8";display:inline-block;width:1em;font-size:.78em;
+  color:var(--ink-3);transition:transform .15s ease;transform:translateY(-1px)}
+.fold[data-open="1"] > .head h3::before{transform:rotate(90deg) translateX(-1px)}
+.fold[data-open="0"] > .head ~ *{display:none}
+.fold > .head:focus-visible{outline:2px solid var(--brand);outline-offset:3px;border-radius:6px}
+@media (prefers-reduced-motion:reduce){.fold > .head h3::before{transition:none}}
+@media (max-width:30rem){
+  .bar{gap:9px;padding:9px 20px} .brand img{height:32px;width:32px}
+  .brand .nm{font-size:17px} .brand .sub{display:none}
+  .card{padding:17px 17px}
+}
+</style>
+</head>
+<body data-view="simple">
+<div class="wrap">
+
+<header class="bar">
+  <div class="brand">
+    <img src="assets/biosense-mark.png" alt="">
+    <div>
+      <div class="nm">BioSense<span>AI</span></div>
+      <div class="sub">Agentic orchestration</div>
+    </div>
+  </div>
+  <nav class="modes" aria-label="Section">
+    <a href="console.html" aria-current="page">AI Discovery</a>
+    <a href="runs.html">Runs</a>
+    <a href="simulator.html">Simulator</a>
+    <a href="data.html">Data</a>
+    <a href="loop.html">Quick loop</a>
+    <a href="index.html">Loop tracker</a>
+  </nav>
+  <div class="spacer"></div>
+  <span id="runbeacon" hidden></span>
+  <span id="identity" class="row" style="margin:0;gap:8px"></span>
+  <button class="btn" id="theme" title="Switch light / dark">Theme</button>
+</header>
+
+<section class="glass card" id="signinCard" hidden>
+  <div class="head"><h3>Sign in</h3>
+    <span class="hint">through your Omnigent account</span></div>
+  <form id="signinForm" class="fields">
+    <div class="fld">
+      <label for="signinServer">Omnigent server</label>
+      <input type="text" id="signinServer" placeholder="https://your-omnigent-server">
+      <p class="hint">The server you run <code>omnigent login</code> against. BioSense forwards
+        your password to it once and never stores it; the session token stays on the server side
+        of this application and never reaches your browser.</p>
+    </div>
+    <div class="two">
+      <div class="fld"><label for="signinUser">Email or username</label>
+        <input type="text" id="signinUser" autocomplete="username"></div>
+      <div class="fld"><label for="signinPass">Password</label>
+        <input type="password" id="signinPass" autocomplete="current-password"
+          style="width:100%;font-size:15px;padding:10px 13px;border-radius:10px;
+                 border:1px solid var(--line);background:var(--glass-2);color:var(--ink)"></div>
+    </div>
+    <div class="row">
+      <button class="btn go" type="submit">Sign in</button>
+      <span class="dim" id="signinMsg"></span>
+    </div>
+  </form>
+  <p class="caveat" id="identityNote"></p>
+</section>
+
+<div class="cols">
+  <div class="stack">
+
+    <section class="glass card">
+      <div class="head">
+        <h3>Run AI discovery</h3>
+        <span class="rt-badge synthetic_demo" id="runtimeBadge"></span>
+      </div>
+
+      <div class="fields">
+        <div class="fld">
+          <label for="project">Project</label>
+          <div class="row" style="margin:0;gap:10px;flex-wrap:nowrap">
+            <select id="project" style="flex:1 1 auto;min-width:0"></select>
+            <button class="btn" id="newProjectBtn" type="button">+ Create project</button>
+          </div>
+          <p class="hint" id="projectNote"></p>
+          <div class="row" style="margin-top:8px;gap:10px">
+            <span class="dim" id="projectRuns"></span>
+            <button class="btn" id="projectDetailBtn" type="button" aria-expanded="false">
+              Project detail</button>
+          </div>
+          <div id="projectDetail" hidden></div>
+          <!-- This project's runs, newest first, each one click from reopening. -->
+          <div id="projectRunList" class="prunlist"></div>
+        </div>
+
+        <section class="glass card" id="newProjectCard" hidden
+                 style="margin:4px 0 6px;padding:18px 20px">
+          <div class="head"><h3>Create project</h3>
+            <span class="hint">a durable workspace: it survives a refresh, a restart and a
+              redeploy</span></div>
+          <form id="newProjectForm" class="fields">
+            <div class="fld">
+              <label for="npName">Name</label>
+              <input type="text" id="npName" placeholder="Human Macrophage Optimization"
+                     required maxlength="120">
+            </div>
+            <div class="two">
+              <div class="fld"><label for="npSpecies">Species</label>
+                <input type="text" id="npSpecies" placeholder="Human"></div>
+              <div class="fld"><label for="npTarget">Cell type / lineage</label>
+                <input type="text" id="npTarget" placeholder="Macrophage"></div>
+            </div>
+            <div class="two">
+              <div class="fld"><label for="npStart">Starting cell</label>
+                <input type="text" id="npStart" placeholder="iPSC"></div>
+              <div class="fld"><label for="npState">Cell state (optional)</label>
+                <input type="text" id="npState" placeholder="CD14+ monocyte-derived"></div>
+            </div>
+            <div class="fld">
+              <label for="npProcess">Process / therapy context</label>
+              <input type="text" id="npProcess" placeholder="iPSC → macrophage">
+            </div>
+            <div class="fld">
+              <label for="npGoal">Goal</label>
+              <input type="text" id="npGoal" placeholder="Improve viable macrophage output">
+            </div>
+            <div class="fld">
+              <label for="npTemplate">Start from a profile (optional)</label>
+              <select id="npTemplate"></select>
+              <p class="hint">A template brings a described process and, where it has one, a
+                mechanistic model. Without one the project is created with the shared
+                bioreactor parameters and no simulator — which it says plainly.</p>
+            </div>
+            <div class="row">
+              <button class="btn go" type="submit">Create project</button>
+              <button class="btn" type="button" id="npCancel">Cancel</button>
+              <span class="dim" id="npMsg"></span>
+            </div>
+          </form>
+        </section>
+
+        <div class="fld">
+          <label for="runName">Name this run <span class="dim">(optional)</span></label>
+          <input id="runName" type="text" maxlength="120" autocomplete="off"
+            placeholder="GM-CSF swap, round 1">
+          <p class="hint">What you will call it in the run list. Runs on one objective look
+            alike there; a name is how you tell them apart. You can rename it later, and it
+            never changes what the agents were asked.</p>
+        </div>
+
+        <div class="fld">
+          <label for="objective">Scientific objective</label>
+          <textarea id="objective" spellcheck="false"
+            placeholder="Increase viable macrophage production while maintaining macrophage identity and viability."></textarea>
+          <p class="hint">What you want to find out, in your own words. It travels as data: it is
+            never put into a command line.</p>
+        </div>
+
+        <details>
+          <summary>Research context, data and constraints</summary>
+          <div class="fields" style="margin-top:14px">
+            <div class="fld">
+              <span class="lab">Evidence scope</span>
+              <div class="two">
+                <div><label for="ctxSpecies">Species</label>
+                  <input type="text" id="ctxSpecies" placeholder="human"></div>
+                <div><label for="ctxCellTypes">Cell types</label>
+                  <input type="text" id="ctxCellTypes" placeholder="macrophage, monocyte"></div>
+              </div>
+              <div class="two" style="margin-top:12px">
+                <div><label for="ctxStates">States</label>
+                  <input type="text" id="ctxStates" placeholder="differentiating, mature"></div>
+                <div><label for="ctxTissues">Tissue</label>
+                  <input type="text" id="ctxTissues" placeholder=""></div>
+              </div>
+              <div class="two" style="margin-top:12px">
+                <div><label for="ctxDisease">Disease context</label>
+                  <input type="text" id="ctxDisease" placeholder=""></div>
+                <div><label for="ctxStrictness">How strictly to apply it</label>
+                  <select id="ctxStrictness">
+                    <option value="prefer">prefer — show out-of-scope evidence, ranked lower and labelled</option>
+                    <option value="strict">strict — exclude out-of-scope evidence</option>
+                    <option value="open">open — no restriction</option>
+                  </select></div>
+              </div>
+              <p class="hint">Comma-separated. A mouse result is not a weaker answer about human
+                cells; it is an answer to a different question, so a mismatch is shown rather
+                than absorbed.</p>
+            </div>
+
+            <div class="fld">
+              <span class="lab">Your data</span>
+              <div class="picks" id="datasetPicks"></div>
+              <p class="hint" id="datasetNote"></p>
+            </div>
+
+            <div class="fld">
+              <span class="lab">Values to test</span>
+              <div class="row" style="margin-top:0">
+                <select id="candParam" style="flex:1 1 14rem"></select>
+                <input type="text" id="candValue" inputmode="decimal" placeholder="value"
+                  style="flex:0 1 8rem">
+                <button class="btn" id="candAdd" type="button">Add</button>
+              </div>
+              <div class="picks" id="candList" style="margin-top:10px"></div>
+              <p class="hint">Optional. Name a value and the run can put it in a protocol;
+                leave it out and a hypothesis will say which way to move without claiming how
+                far, which is the honest answer when nothing supports a number.</p>
+            </div>
+
+            <div class="fld">
+              <label for="constraints">Process constraints</label>
+              <textarea id="constraints" style="min-height:70px;font-size:15px"
+                placeholder="What this process cannot do, whatever the evidence says."></textarea>
+            </div>
+          </div>
+        </details>
+
+        <div class="fld">
+          <span class="lab">Runtime</span>
+          <div class="rt-grid" id="runtimes"></div>
+          <!-- How much the specialists may spend. Most of a run's time is the
+               literature agent's turns, so this is the knob for faster or deeper. -->
+          <label class="lab" for="effort" style="margin-top:14px">Depth</label>
+          <select id="effort" class="select">
+            <option value="quick">Quick — about 4 searches, 2 full texts, ~5 min per specialist</option>
+            <option value="standard" selected>Standard — about 8 searches, 4 full texts, ~10 min</option>
+            <option value="thorough">Thorough — about 14 searches, 8 full texts, ~20 min</option>
+          </select>
+          <!-- One literature agent is the default. By stage runs one per process stage
+               in parallel and merges them: faster literature, more model calls. -->
+          <!-- Where the cells actually are. Nobody starts in a bioreactor: the
+               plate is where a factor is tried, the tube is where aggregates
+               first form, the tank is where the numbers come from. The choice
+               changes what the agents look for, and a finished protocol can be
+               laid out in any of the three afterwards. -->
+          <label class="lab" for="cultureFormat" style="margin-top:14px">Where it will run</label>
+          <select id="cultureFormat" class="select">
+            <option value="" selected>The project's own vessel (default)</option>
+            <option value="six_well">6-well plate — try a factor first, many conditions, cheap</option>
+            <option value="cero">CERO 3D rotating tube — real suspension aggregates, 50 mL</option>
+            <option value="stirred_tank">Stirred-tank bioreactor — controlled, instrumented, the cell numbers</option>
+          </select>
+          <div class="note" id="cultureFormatNote"></div>
+          <label class="lab" for="purpose" style="margin-top:14px">What this run is for</label>
+          <select id="purpose" class="select">
+            <option value="discovery" selected>A question about this process (default)</option>
+            <option value="process_reference">Build the process reference — cited bioreactor setpoints, any cell type</option>
+          </select>
+          <label class="lab" for="publicData" style="margin-top:14px">Public databases</label>
+          <select id="publicData" class="select">
+            <option value="on" selected>Allowed — gene records (Ensembl, UniProt, STRING) and real GEO datasets (default)</option>
+            <option value="off">Off — committed knowledge sets and named datasets only</option>
+          </select>
+          <label class="lab" for="litMode" style="margin-top:14px">Literature search</label>
+          <select id="litMode" class="select">
+            <option value="single" selected>One agent across every lever (default)</option>
+            <option value="by_stage">One agent per process stage, in parallel — faster, uses more of the model allowance</option>
+            <option value="specialist">Specialist (staged) — how the cell develops and every known way of making it first, then the route that fits, then its parameters</option>
+          </select>
+          <!-- Bioinformatics, by the same pattern: one agent, or one specialist per
+               fixed category — kinds of analysis, or parts of the process. Each
+               specialist is another agent session, so each costs model allowance. -->
+          <label class="lab" for="bioMode" style="margin-top:14px">Bioinformatics</label>
+          <select id="bioMode" class="select">
+            <option value="single" selected>One agent across everything (default)</option>
+            <option value="by_analysis">By analysis — gene expression · cell phenotype (FACS) · proteins &amp; secretome · gene regulation</option>
+            <option value="by_process">By process — iPSC expansion · lineage commitment · differentiation &amp; maturation · product at harvest</option>
+          </select>
+          <p class="hint">A synthetic run and a real one are different claims about the same
+            question. BioSense never substitutes one for the other: if a real runtime is
+            unavailable the run fails with the reason, and says what fixes it.</p>
+          <div class="limits" id="limits" hidden></div>
+          <div class="limits" id="allowance" hidden></div>
+        </div>
+      </div>
+
+      <div class="row">
+        <button class="btn go" id="runBtn">Run AI discovery</button>
+        <!-- Shown only while a run is live. It interrupts the orchestrator and every
+             specialist still working; whatever they wrote is kept, and the run is
+             recorded as stopped, never as an answer. -->
+        <button class="btn stop" id="stopBtn" type="button" hidden>Stop run</button>
+      </div>
+      <div id="runState" hidden style="margin-top:14px"></div>
+    </section>
+
+    <!-- The answer, in the order a person acts on it: what the run thinks is
+         true, then the experiment that settles it, then the numbers to set. -->
+    <section class="glass card" id="resultPanel" hidden>
+      <div class="head"><h3>The hypothesis</h3><span class="hint" id="resultHead"></span></div>
+      <div id="hypothesis"></div>
+    </section>
+
+    <!-- What the literature agent writes as it reads, before the orchestrator
+         has weighed it: leads for the scientist watching, labelled as such.
+         Beside the hypothesis, because it is what the hypothesis came from. -->
+    <section class="glass card" id="insightsPanel" hidden>
+      <div class="head"><h3>Insights as they come</h3><span class="hint" id="insightsHead"></span></div>
+      <!-- One foldable section per source, each remembering whether it is open.
+           Every paper's note folds on its own, so a long run stays scannable. -->
+      <details class="ins-sec" id="litSec" data-key="lit">
+        <summary><span class="ins-t">Literature</span> <span class="dim" id="litSum"></span></summary>
+        <div class="sec-export" data-section="literature" hidden></div>
+        <p class="dim" id="insightsNote"></p>
+        <div id="litStages"></div>
+        <div id="insights" class="insights"></div>
+        <details class="ins-sub" id="papersSec" data-key="papers">
+          <summary>Papers found <span class="dim" id="papersSum"></span></summary>
+          <div id="papersFound"></div>
+        </details>
+      </details>
+      <details class="ins-sec" id="refSec" data-key="ref" hidden>
+        <summary><span class="ins-t">Process reference draft</span> <span class="dim" id="refSum"></span></summary>
+        <div id="refDraft"></div>
+      </details>
+      <details class="ins-sec" id="bioSec" data-key="bio" hidden>
+        <summary><span class="ins-t">Bioinformatics &amp; data analysis</span> <span class="dim" id="bioSum"></span></summary>
+        <div class="sec-export" data-section="bioinformatics" hidden></div>
+        <div id="bioInsights"></div>
+      </details>
+      <details class="ins-sec" id="genoSec" data-key="geno" hidden>
+        <summary><span class="ins-t">Simulated: wild type against the edit</span>
+          <span class="dim" id="genoSum"></span></summary>
+        <div id="genoInsights"></div>
+      </details>
+      <details class="ins-sec" id="termsSec" data-key="terms" hidden>
+        <summary><span class="ins-t">Proposed simulator terms</span>
+          <span class="dim" id="termsSum"></span></summary>
+        <div id="termsInsights"></div>
+      </details>
+      <details class="ins-sec" id="routeSec" data-key="route" hidden>
+        <summary><span class="ins-t">Production route</span>
+          <span class="dim" id="routeSum"></span></summary>
+        <div id="routeInsights"></div>
+      </details>
+      <details class="ins-sec" id="devSec" data-key="dev" hidden>
+        <summary><span class="ins-t">Developmental biology</span>
+          <span class="dim" id="devSum"></span></summary>
+        <div id="devInsights"></div>
+      </details>
+      <details class="ins-sec" id="baseSec" data-key="base" hidden>
+        <summary><span class="ins-t">The published route, stage by stage</span>
+          <span class="dim" id="baseSum"></span></summary>
+        <div id="baseInsights"></div>
+      </details>
+      <details class="ins-sec" id="fidSec" data-key="fid" hidden>
+        <summary><span class="ins-t">How close to the real cell</span>
+          <span class="dim" id="fidSum"></span></summary>
+        <div id="fidInsights"></div>
+      </details>
+      <details class="ins-sec" id="sotaSec" data-key="sota" hidden>
+        <summary><span class="ins-t">State of the art</span>
+          <span class="dim" id="sotaSum"></span></summary>
+        <div id="sotaInsights"></div>
+      </details>
+      <details class="ins-sec" id="anaSec" data-key="ana" hidden>
+        <summary><span class="ins-t">Analysis details</span>
+          <span class="dim" id="anaSum"></span></summary>
+        <div class="sec-export" data-section="bioinformatics" hidden></div>
+        <div id="analyses"></div>
+      </details>
+    </section>
+
+    <!-- Round 1 is the next thing that happens, so it is a section rather than
+         a fold: the arms, and everything somebody needs to actually run them. -->
+    <section class="glass card" id="roundPanel" hidden>
+      <div class="head"><h3 id="roundTitle">Round 1 at the bench</h3>
+        <span class="hint" id="roundSum"></span></div>
+      <div id="roundInsights"></div>
+    </section>
+
+    <section class="glass card" id="protocolPanel" hidden>
+      <div class="head"><h3>Current estimated parameters</h3>
+        <span class="hint" id="protocolHint">the protocol this run recommends, stage by stage</span></div>
+      <div id="protocol"></div>
+    </section>
+
+    <section class="glass card" id="otherPanel" hidden>
+      <div class="head"><h3>Other hypotheses</h3>
+        <span class="hint">every one, and what became of it</span></div>
+      <div id="otherHyps"></div>
+    </section>
+
+    <!-- What the run could not fetch, asked of the person who can supply it.
+         Answering changes nothing here; the next round reads the answers. -->
+    <section class="glass card" id="askDataPanel" hidden>
+      <div class="head"><h3>The run needs your help</h3>
+        <span class="hint" id="askDataHead"></span></div>
+      <div id="askDataList"></div>
+    </section>
+
+    <!-- Challenge the result before acting on it: the orchestrator answers from
+         what this run wrote. Read-only; new evidence is a follow-up run's job. -->
+    <section class="glass card" id="askPanel" hidden>
+      <div class="head"><h3>Ask the orchestrator</h3>
+        <span class="hint">about this run, before you take it to the bench</span></div>
+      <div id="askList"></div>
+      <form id="askForm" class="ask-form">
+        <textarea id="askText" maxlength="2000" spellcheck="true"
+          placeholder="Why this inducer and not another? What would change your recommendation? Is the purity estimate from the same cell type?"></textarea>
+        <div class="row"><button class="btn go" id="askBtn" type="submit">Ask</button>
+          <!-- The same conversation, a different kind of turn: this one writes
+               one file. A person picks the leads the run surfaced and gets them
+               back as plans with arms, beside the main hypothesis. -->
+          <button class="btn" id="altBtn" type="button">Work this up as an alternate plan</button>
+          <!-- The third kind of turn: the written protocol, changed for the
+               bench copy. The vessel, a value of the person's own, a note, a
+               section left out — written to one file and laid over every
+               export. The run's own protocol is never rewritten. -->
+          <button class="btn" id="editBtn" type="button">Change the protocol document</button>
+          <!-- The fourth kind: the experiment past the apparatus. Written to one
+               file beside round 1; only the apparatus is lifted, never the aim,
+               the QC limits or a safety bound. -->
+          <button class="btn" id="btBtn" type="button">Design past the apparatus</button>
+          <!-- The fifth kind: the run written up for reading. One file,
+               narrative only, every number checked against the protocol; the
+               final-report export then carries it beside the tables. -->
+          <button class="btn" id="repBtn" type="button">Write the run up</button>
+          <span class="dim" id="askMsg"></span></div>
+        <p class="caveat">A question answers from this run's files and changes nothing. An
+          alternate plan is written into the run beside the main hypothesis — it never changes
+          the main hypothesis, the protocol or round 1, whose rules were fixed before any
+          result existed. A protocol change edits the bench copy only: the vessel it is laid
+          out for, a value of yours (checked against the project, marked D with your name), a
+          note in your words (marked P), or a section left out; then export it as Word or PDF
+          below. "Design past the apparatus" writes the experiment that would get closest to
+          the aim if the vessel were not the limit — a concept beside round 1, never runnable
+          here or approved; the aim, the QC limits and safety bounds are kept. "Write the run
+          up" has the communication agent write the plain-language layer of the final report —
+          an executive summary and what each stage looks like at the bench; every number in it
+          must already stand in the protocol, and every value still prints from the protocol's
+          own rows. None of these
+          searches again; a follow-up run gathers new evidence.</p>
+      </form>
+    </section>
+
+    <!-- The other leads, worked up as experiments at a person's request. Beside
+         round 1, never inside it: round 1's rules were fixed before any result. -->
+    <section class="glass card" id="altPanel" hidden>
+      <div class="head"><h3>Alternate and extended plans</h3>
+        <span class="hint" id="altHead"></span></div>
+      <div id="altList"></div>
+    </section>
+
+    <!-- The experiment past the apparatus: what it lifts, the stages, the arms,
+         and a judgement range. A concept beside round 1, never in it. -->
+    <section class="glass card" id="btPanel" hidden>
+      <div class="head"><h3>Beyond the apparatus</h3>
+        <span class="hint" id="btHead"></span></div>
+      <div class="sec-export" data-section="breakthrough" hidden></div>
+      <div id="btBody"></div>
+    </section>
+
+    <section class="glass card" id="benchPanel" hidden>
+      <div class="head"><h3>Benchmark</h3>
+        <span class="hint">system capability, not biological truth</span></div>
+      <div id="benchmark"></div>
+    </section>
+
+  </div>
+
+  <div class="stack">
+    <!-- Folds like the sidebar panels, and folds itself once the run has ended
+         so the recommendation, not the tracking, is what the page is about. -->
+    <section class="glass card fold" id="progressPanel" data-open="1" hidden>
+      <div class="head"><h3>Live</h3>
+        <span class="hint" id="runRef"></span></div>
+      <div id="rvHead"></div>
+      <div class="lab">Workflow</div>
+      <div id="rvStages"></div>
+      <div class="lab">Agents</div>
+      <div class="agents" id="rvAgents"></div>
+      <div class="lab">Activity</div>
+      <div class="tlbox" id="rvTimeline"></div>
+      <div class="lims" id="rvLims" hidden></div>
+    </section>
+
+    <section class="glass card fold" data-open="1">
+      <div class="head"><h3>Candidate parameters</h3>
+        <span class="hint">what to turn next</span></div>
+      <div id="candidates" class="dim">Nothing proposed yet.</div>
+    </section>
+
+    <section class="glass card fold" id="evidencePanel" data-open="1" hidden>
+      <div class="head"><h3>Evidence</h3><span class="hint">by what it is</span></div>
+      <div id="evidence"></div>
+    </section>
+
+    <section class="glass card fold" data-open="0">
+      <div class="head"><h3>Record</h3><span class="hint" id="evCount"></span></div>
+      <div class="feed" id="feed">
+        <p class="dim">Nothing running yet.</p>
+      </div>
+    </section>
+
+    <section class="glass card fold" data-open="1">
+      <div class="head"><h3>Export</h3><span class="hint">from this run</span></div>
+      <div class="export" id="exports">
+        <p class="dim">Available once a run has finished.</p>
+      </div>
+    </section>
+
+    <section class="glass card fold" data-open="0">
+      <div class="head"><h3>Benchmarks</h3><span class="hint">read or re-run</span></div>
+      <div id="benchList" class="dim">loading…</div>
+      <div class="lab">Run one again</div>
+      <div id="benchRun"></div>
+      <p class="caveat" id="benchNote"></p>
+    </section>
+  </div>
+</div>
+
+</div>
+<script>
+/* theme: shared behaviour, kept inline so the page works before any module loads */
+(function () {
+  let saved = null; try { saved = localStorage.getItem('bs-theme'); } catch (_) {}
+  if (saved) document.documentElement.setAttribute('data-theme', saved);
+  document.querySelector('#theme').addEventListener('click', () => {
+    const cur = document.documentElement.getAttribute('data-theme')
+      || (matchMedia('(prefers-color-scheme:dark)').matches ? 'dark' : 'light');
+    const next = cur === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem('bs-theme', next); } catch (_) {}
+  });
+})();
+/* folding panels: the heading is the control, so the whole row is the hit
+   target, and the state is remembered per panel. */
+(function () {
+  const KEY = 'bs-folds';
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (_) {}
+  document.querySelectorAll('.fold').forEach((sec, i) => {
+    const head = sec.querySelector('.head');
+    const id = sec.id || 'fold' + i;
+    if (id in saved) sec.dataset.open = saved[id] ? '1' : '0';
+    head.setAttribute('role', 'button');
+    head.setAttribute('tabindex', '0');
+    const sync = () => head.setAttribute('aria-expanded', sec.dataset.open === '1');
+    sync();
+    const toggle = () => {
+      sec.dataset.open = sec.dataset.open === '1' ? '0' : '1';
+      sync();
+      saved[id] = sec.dataset.open === '1';
+      try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (_) {}
+    };
+    head.addEventListener('click', toggle);
+    head.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+  });
+})();
+</script>
+<script src="runstate.js"></script>
+<script src="curves.js"></script>
+<script src="runview.js"></script>
+<script src="discovery.js"></script>
+<script src="canvas.js"></script>
+</body>
+</html>

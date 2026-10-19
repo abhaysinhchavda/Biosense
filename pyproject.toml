@@ -1,0 +1,55 @@
+[project]
+name = "biosense-ai"
+version = "0.1.0"
+description = "Omnigent agents for iPSC production protocols: literature evidence, bioreactor-run analysis, orchestration and toy biosimulation"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12"
+dependencies = [
+    "jsonschema>=4.26.0",
+    "numpy>=2.5.3",
+    "scipy>=1.18.1",
+]
+
+# Optional analysis environments. The base install stays at three dependencies
+# so ordinary CI is fast and a clone works everywhere; a modality that needs a
+# heavy stack declares an extra and REFUSES with the install line when it is
+# absent, rather than silently doing something cheaper and calling it the same
+# analysis.
+#
+#   uv sync --extra singlecell
+#   uv sync --all-extras
+[project.optional-dependencies]
+# anndata brings h5py and gives a real .h5ad reader. Scanpy is deliberately NOT
+# here: QC, proportions, pseudobulk and score computation are numpy/scipy work
+# this repository already does well, and clustering and UMAP are exactly the
+# steps that should not run unless they resolve the named uncertainty.
+singlecell = ["anndata>=0.12", "h5py>=3.14"]
+#
+# The Omnigent client SDK, needed by exactly one module
+# (biosense/production/omnigent_runtime.py) and only when a real-AI runtime is
+# configured. It is an extra rather than a base dependency because it pulls the
+# whole Omnigent server stack, and the synthetic and deterministic paths — which
+# is all ordinary CI runs — must stay a three-dependency install.
+#
+# A deployment that serves real AI installs it; nobody should have to run
+# `uv add` by hand after cloning:
+#
+#   uv sync --extra omnigent
+#
+omnigent = ["omnigent-client>=0.16.0,<0.17"]
+#
+# NOT declared, and why:
+#   cytometry (raw FCS)  fcsparser pins numpy below 2.5 and cannot resolve
+#                        against this project's numpy. Rather than pin the whole
+#                        project backwards for an optional reader, raw FCS stays
+#                        Phase 3 and the ingest path refuses an .fcs file with
+#                        that reason. Processed, gated tables need no extra.
+#   chromatin            BED and narrowPeak are columnar text; the stdlib reads
+#                        them.
+#   bulk RNA             DESeq2 and edgeR run through the external-tool adapter
+#                        as Rscript, never in-process, so there is no Python
+#                        dependency to declare.
+
+[tool.uv]
+package = false
