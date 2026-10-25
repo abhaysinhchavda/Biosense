@@ -9,6 +9,7 @@ ephemeral: runs live only as long as the instance does. See deploy/README.md for
 the hosts this app is built for.
 """
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from biosense import workspace as WS
 from biosense.data import roots as DR
@@ -31,6 +32,16 @@ _policy = AZ.from_env()
 
 
 class handler(A.Handler):
+    def parse_request(self):
+        # Vercel rewrites hand us the destination (/api/index), not the URL the
+        # visitor asked for; vercel.json carries the original path in `__p`.
+        ok = super().parse_request()
+        if ok and urlparse(self.path).path == '/api/index':
+            q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            p = q.pop('__p', [''])[0]
+            self.path = '/' + p.lstrip('/') + ('?' + urlencode(q, doseq=True) if q else '')
+        return ok
+
     runs_dir = RUNS
     static_dir = STATIC
     registry = A.Registry(RUNS)
